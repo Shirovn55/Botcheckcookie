@@ -909,17 +909,21 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             "📦 <b>Check đơn hàng Shopee</b>\n"
             "👉 Gửi <b>cookie</b> dạng:\n"
             "<code>SPC_ST=xxxxx</code>\n\n"
-            "🚚 <b>Tra mã vận đơn SPX</b>\n"
+            "🚚 <b>Tra mã vận đơn</b>\n"
             "👉 Gửi mã dạng:\n"
             "<code>SPXVNxxxxx</code>\n\n"
+            "🚛 <b>Hỗ trợ các bên vận chuyển</b>\n"
+            "• 🟠 <b>Shopee Express (SPX)</b>\n"
+            "• 🟢 <b>Giao Hàng Nhanh (GHN)</b>\n\n"
             "⚠️ <b>Lưu ý</b>\n"
             "• Mỗi dòng 1 dữ liệu\n"
             "• Gửi nhiều dòng → bot check lần lượt\n"
             "• Spam quá nhanh sẽ bị khóa tạm thời\n\n"
-            "🧩 <i>Hệ thống Bot – Tự động & An toàn</i>",
+            "🧩 <i>Hệ thống NgânMiu.Store – Tự động & An toàn</i>",
             main_keyboard()
         )
         return
+
 
 
     # 💰 SỐ DƯ
