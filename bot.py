@@ -363,7 +363,7 @@ def main_keyboard():
     return {
         "keyboard": [
             ["✅ Kích Hoạt", "💰 Số dư"],
-            ["💳 Nạp Tiền", "🎟️ Bot Lưu Voucher"],
+            ["💳 Nạp Tiền", "📘 Hướng dẫn"],
             ["🧩 Hệ Thống Bot NgânMiu"]
         ],
         "resize_keyboard": True
@@ -898,6 +898,25 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             "❌ <b>CHƯA KÍCH HOẠT</b>\n\n"
             "👉 Hãy kích hoạt tại bot lưu voucher:\n"
             "🎟️ @nganmiu_bot",
+            main_keyboard()
+        )
+        return
+    if text == "📘 Hướng dẫn":
+        tg_send(
+            chat_id,
+            "📘 <b>HƯỚNG DẪN SỬ DỤNG BOT</b>\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "📦 <b>Check đơn hàng Shopee</b>\n"
+            "👉 Gửi <b>cookie</b> dạng:\n"
+            "<code>SPC_ST=xxxxx</code>\n\n"
+            "🚚 <b>Tra mã vận đơn SPX</b>\n"
+            "👉 Gửi mã dạng:\n"
+            "<code>SPXVNxxxxx</code>\n\n"
+            "⚠️ <b>Lưu ý</b>\n"
+            "• Mỗi dòng 1 dữ liệu\n"
+            "• Gửi nhiều dòng → bot check lần lượt\n"
+            "• Spam quá nhanh sẽ bị khóa tạm thời\n\n"
+            "🧩 <i>Hệ thống Bot – Tự động & An toàn</i>",
             main_keyboard()
         )
         return
