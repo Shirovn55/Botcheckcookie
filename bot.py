@@ -927,41 +927,34 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
                 )
                 return
 
-        # DO CHECK
+        # ================= DO CHECK =================
         if is_cookie(val):
             result, error = check_shopee_orders(val)
-            # DO CHECK
 
-            if is_cookie(val):
-                result, error = check_shopee_orders(val)
-
-                if not result:
-                    if error == "cookie_expired":
-                        tg_send(
-                            chat_id,
-                            "🔒 <b>COOKIE KHÔNG HỢP LỆ</b>\n\n"
-                            "❌ Cookie đã <b>hết hạn</b> hoặc <b>bị Shopee khóa</b>.\n\n"
-
-                        )
-                        log_check(tele_id, username, val, balance, "cookie_expired")
-                    else:
-                        tg_send(
-                            chat_id,
-                            "📭 <b>KHÔNG CÓ ĐƠN HÀNG</b>\n\n"
-                            "Cookie hợp lệ nhưng hiện <b>không có đơn nào</b>."
-                        )
-                        log_check(tele_id, username, val, balance, "no_orders")
-
-                    return
-
+            if not result:
+                if error == "cookie_expired":
+                    tg_send(
+                        chat_id,
+                        "🔒 <b>COOKIE KHÔNG HỢP LỆ</b>\n\n"
+                        "❌ Cookie đã <b>hết hạn</b> hoặc <b>bị Shopee khóa</b>."
+                    )
+                    log_check(tele_id, username, val, balance, "cookie_expired")
                 else:
-                    tg_send(chat_id, result)
-                    log_check(tele_id, username, val, balance, "check_orders")
+                    tg_send(
+                        chat_id,
+                        "📭 <b>KHÔNG CÓ ĐƠN HÀNG</b>\n\n"
+                        "Cookie hợp lệ nhưng hiện <b>không có đơn nào</b>."
+                    )
+                    log_check(tele_id, username, val, balance, "no_orders")
 
             else:
-                result = check_spx(val)
                 tg_send(chat_id, result)
-                log_check(tele_id, username, val, balance, "check_spx")
+                log_check(tele_id, username, val, balance, "check_orders")
+
+        elif is_spx(val):
+            result = check_spx(val)
+            tg_send(chat_id, result)
+            log_check(tele_id, username, val, balance, "check_spx")
 
 
 
