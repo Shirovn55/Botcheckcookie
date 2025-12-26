@@ -359,16 +359,16 @@ def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
         )
     except Exception:
         pass
-
-def main_keyboard() -> Dict[str, Any]:
+def main_keyboard():
     return {
-        "inline_keyboard": [
-            [{"text": "✅ Kích hoạt", "callback_data": "ACTIVATE"}],
-            [{"text": "💰 Check số dư", "callback_data": "BALANCE"}],
-            [{"text": "📦 Check cookie / SPX", "callback_data": "CHECK"}],
-            [{"text": "📌 Hướng dẫn", "callback_data": "HELP"}],
-        ]
+        "keyboard": [
+            ["✅ Kích Hoạt", "💰 Số dư"],
+            ["💳 Nạp Tiền", "🎟️ Bot Lưu Voucher"],
+            ["🧩 Hệ Thống Bot NgânMiu"]
+        ],
+        "resize_keyboard": True
     }
+
 
 # =========================================================
 # CALLBACK HANDLER
@@ -858,10 +858,120 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         tg_send(
             chat_id,
             "🤖 <b>BOT CHECK ĐƠN HÀNG SHOPEE + SPX</b>\n\n"
-            "Dùng các nút bên dưới để thao tác.",
+            "Chọn chức năng bên dưới 👇",
             main_keyboard()
         )
         return
+    # ================== MENU BUTTONS ==================
+
+    # ✅ KÍCH HOẠT (check đã kích ở bot add voucher)
+    if text == "✅ Kích Hoạt":
+        row_idx, user = get_user_row(tele_id)
+
+        if not user:
+            tg_send(
+                chat_id,
+                "❌ <b>CHƯA KÍCH HOẠT</b>\n\n"
+                "👉 Vui lòng kích hoạt tại bot lưu voucher trước:\n"
+                "🎟️ @nganmiu_bot",
+                main_keyboard()
+            )
+            return
+
+        status = safe_text(
+            user.get("status")
+            or user.get("trạng thái")
+            or user.get("active")
+        ).lower()
+
+        if status == "active":
+            tg_send(
+                chat_id,
+                "✅ <b>TÀI KHOẢN ĐÃ KÍCH HOẠT</b>\n\n"
+                "Bạn có thể sử dụng bot bình thường 🚀",
+                main_keyboard()
+            )
+            return
+
+        tg_send(
+            chat_id,
+            "❌ <b>CHƯA KÍCH HOẠT</b>\n\n"
+            "👉 Hãy kích hoạt tại bot lưu voucher:\n"
+            "🎟️ @nganmiu_bot",
+            main_keyboard()
+        )
+        return
+
+
+    # 💰 SỐ DƯ
+    if text == "💰 Số dư":
+        row_idx, user = get_user_row(tele_id)
+
+        if not user:
+            tg_send(
+                chat_id,
+                "❌ <b>Bạn chưa kích hoạt</b>\n\n"
+                "👉 Kích hoạt tại @nganmiu_bot",
+                main_keyboard()
+            )
+            return
+
+        balance = get_balance(user)
+
+        tg_send(
+            chat_id,
+            f"💰 <b>SỐ DƯ HIỆN TẠI</b>\n\n"
+            f"{balance:,} đ",
+            main_keyboard()
+        )
+        return
+
+
+    # 💳 NẠP TIỀN
+    if text == "💳 Nạp Tiền":
+        tg_send(
+            chat_id,
+            "💳 <b>NẠP TIỀN</b>\n\n"
+            "👉 Vui lòng nạp tiền tại bot chính:\n"
+            "💸 @nganmiu_bot",
+            main_keyboard()
+        )
+        return
+
+
+    # 🎟️ BOT LƯU VOUCHER
+    if text == "🎟️ Bot Lưu Voucher":
+        tg_send(
+            chat_id,
+            "🎟️ <b>BOT LƯU VOUCHER</b>\n\n"
+            "👉 Mở bot tại:\n"
+            "https://t.me/nganmiu_bot",
+            main_keyboard()
+        )
+        return
+    if text == "🧩 Hệ Thống Bot NgânMiu":
+        tg_send(
+            chat_id,
+            "🧩 <b>HỆ THỐNG BOT NGÂNMIU</b>\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "🧑‍💼 <b>Admin hỗ trợ</b>\n"
+            "👉 @BonBonxHPx\n\n"
+            "👥 <b>Group Hỗ Trợ</b>\n"
+            "👉 https://t.me/botxshopee\n\n"
+            "🤖 <b>Danh sách Bot</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🎟️ <b>Bot Lưu Voucher</b>\n"
+            "👉 @nganmiu_bot\n\n"
+            "📦 <b>Bot Check Đơn Hàng</b>\n"
+            "👉 @ShopeexCheck_Bot\n\n"
+            "📱 <b>Bot Thuê Số</b>\n"
+            "👉 <i>Sắp mở</i> 🔜\n\n"
+            "✨ <i>Hệ sinh thái tự động hóa Shopee – NgânMiu.Store</i>",
+            main_keyboard()
+        )
+        return
+
+
 
     # ---------- USER CHECK ----------
     row_idx, user = get_user_row(tele_id)
