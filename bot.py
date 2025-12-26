@@ -966,7 +966,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             "👉 @ShopeexCheck_Bot\n\n"
             "📱 <b>Bot Thuê Số</b>\n"
             "👉 <i>Sắp mở</i> 🔜\n\n"
-            "✨ <i>Hệ sinh thái tự động hóa Shopee – NgânMiu.Store</i>",
+            "✨ <i>Book Đơn Mã New tại NganMiu.Store</i>",
             main_keyboard()
         )
         return
