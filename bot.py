@@ -120,6 +120,9 @@ def is_cookie(val: str) -> bool:
 
 def is_spx(val: str) -> bool:
     return re.fullmatch(r"SPXVN[0-9A-Z]+", val.strip()) is not None
+def is_ghn_code(text: str) -> bool:
+    t = text.strip().upper()
+    return t.startswith(("GHN", "GYP")) or (t.isdigit() and len(t) >= 8)
 
 def esc(s: str) -> str:
     return html.escape(s or "")
@@ -443,6 +446,18 @@ def handle_callback_query(data: Dict[str, Any]) -> None:
 # =========================================================
 # STATUS ALIAS (ĐỒNG BỘ app.py)
 # =========================================================
+GHN_STATUS_EMOJI = {
+    "Chờ lấy hàng": "🕓",
+    "Nhận hàng tại bưu cục": "📦",
+    "Sẵn sàng xuất đến Kho trung chuyển": "🚚",
+    "Xuất hàng đi khỏi kho": "🚛",
+    "Đang trung chuyển hàng": "🚚",
+    "Nhập hàng vào kho trung chuyển": "🏬",
+    "Đang giao hàng": "🚴",
+    "Giao hàng thành công": "✅",
+    "Giao hàng không thành công": "❌",
+    "Hoàn hàng": "↩️"
+}
 
 CODE_MAP = {
     # ===== GIAO THÀNH CÔNG =====
@@ -797,57 +812,219 @@ def check_shopee_orders(cookie: str) -> Tuple[Optional[str], Optional[str]]:
 # 🔥 SPX CHECK (tramavandon.com - ĐÚNG API)
 # =========================================================
 SPX_API = "https://tramavandon.com/api/spx.php"
-
 def check_spx(code: str) -> str:
     """
     Call đúng API tramavandon.com như app.py
+    Có thêm:
+    - Tên đơn vị vận chuyển
+    - Dự kiến giao hàng (ước tính)
     """
+    import requests
+    from datetime import datetime
+
     code = (code or "").strip().upper()
-    
+
+    SPX_API = "https://tramavandon.com/api/spx.php"
+
     payload = {"tracking_id": code}
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "close"
     }
 
     try:
-        r = requests.post(SPX_API, json=payload, headers=headers, timeout=20)
+        r = requests.post(
+            SPX_API,
+            json=payload,
+            headers=headers,
+            timeout=(5, 10)
+        )
         data = r.json()
 
         if data.get("retcode") != 0:
             return f"🔎 <b>{esc(code)}</b>\n❌ Không tìm thấy thông tin"
 
-        records = data["data"]["sls_tracking_info"]["records"]
-        
+        info = data["data"]["sls_tracking_info"]
+        records = info.get("records", [])
+
         timeline = []
         phone = ""
+        last_ts = None
+        first_ts = None
 
         for rec in records:
             ts = rec.get("actual_time")
-            dt = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M") if ts else ""
-            
-            status_text = rec.get("buyer_description", "")
-            location = rec.get("current_location", {}).get("location_name", "")
+            if not ts:
+                continue
 
-            # Tìm SĐT
+            if not first_ts:
+                first_ts = ts
+            last_ts = ts
+
+            dt = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
+
+            status_text = rec.get("buyer_description", "").strip()
+            location = rec.get("current_location", {}).get("location_name", "").strip()
+
+            # tìm SĐT shipper
             if not phone:
                 found = re.findall(r"\b0\d{9,10}\b", status_text)
                 if found:
                     phone = found[0]
 
-            timeline.append(f"• {dt} — {status_text} — {location}")
+            line = f"• {dt} — {status_text}"
+            if location:
+                line += f" — {location}"
+
+            timeline.append(line)
+
+        # ===== DỰ KIẾN GIAO (ƯỚC TÍNH) =====
+        eta_text = "-"
+        if last_ts:
+            # SPX thường giao sau mốc cuối 1–2 ngày
+            eta = datetime.fromtimestamp(last_ts) + timedelta(days=1)
+            eta_text = eta.strftime("%d/%m/%Y")
 
         timeline_text = "\n".join(timeline[-5:]) if timeline else "Chưa có thông tin"
-        
+
         return (
+            "📦 <b>Shopee Express (SPX)</b>\n"
+            "━━━━━━━━━━━━━━━\n"
             f"🔎 <b>MVĐ:</b> <code>{esc(code)}</code>\n"
-            f"📊 <b>Trạng thái:</b> Đang vận chuyển\n"
+            f"🚚 <b>Trạng thái:</b> Đang vận chuyển\n"
+            f"🕒 <b>Dự kiến giao:</b> {eta_text}\n"
             f"📱 <b>SĐT shipper:</b> <code>{esc(phone) if phone else '-'}</code>\n\n"
-            f"📜 <b>Timeline:</b>\n{timeline_text}"
+            "📜 <b>Timeline:</b>\n"
+            f"{timeline_text}"
         )
 
+    except requests.exceptions.ReadTimeout:
+        return f"🔎 <b>{esc(code)}</b>\n⏱️ SPX phản hồi quá chậm, thử lại sau"
+
     except Exception as e:
-        return f"🔎 <b>{esc(code)}</b>\n❌ Lỗi: {e}"
+        return f"🔎 <b>{esc(code)}</b>\n❌ Lỗi SPX: {e}"
+
+# =========================================================
+# 🔥 SPX GHN 
+# =========================================================    
+def clean_ghn_status(text: str) -> str:
+    """
+    Cắt bỏ nhãn trạng thái chung của GHN, chỉ giữ mô tả chi tiết
+    Ví dụ:
+    'Đang giao hàng – Đơn hàng đang giao đến xxx'
+    -> 'Đơn hàng đang giao đến xxx'
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # GHN dùng dấu " – " hoặc " - " để phân tách
+    if " – " in text:
+        return text.split(" – ", 1)[1].strip()
+
+    if " - " in text:
+        return text.split(" - ", 1)[1].strip()
+
+    return text
+
+
+
+def check_ghn(order_code: str, max_steps: int = 4) -> str:
+    import requests
+    from datetime import datetime
+
+    url = "https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://donhang.ghn.vn",
+        "Referer": "https://donhang.ghn.vn/",
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    payload = {"order_code": order_code.strip()}
+
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        res = r.json()
+    except Exception as e:
+        return f"❌ <b>LỖI GHN</b>\nKhông kết nối được hệ thống\n{e}"
+
+    if res.get("code") != 200:
+        return "❌ <b>KHÔNG TÌM THẤY ĐƠN GHN</b>"
+
+    data = res.get("data", {})
+    info = data.get("order_info", {})
+    logs = data.get("tracking_logs", [])
+
+    # ===== HEADER =====
+    carrier = "GHN | GIAO HÀNG NHANH"
+    status_name = info.get("status_name", "-")
+    emoji = GHN_STATUS_EMOJI.get(status_name, "🚚")
+
+    eta = "-"
+    leadtime = info.get("leadtime")
+    if leadtime:
+        try:
+            eta = datetime.fromisoformat(leadtime.replace("Z", "")).strftime("%d/%m/%Y")
+        except Exception:
+            eta = leadtime[:10]
+
+    # ===== LỌC LOG (GỌN – GIỮ NGUYÊN DATA GỐC) =====
+    timeline = []
+    last_key = None
+
+    for lg in reversed(logs):
+        status = clean_ghn_status(lg.get("status_name", "").strip())
+
+        addr = lg.get("location", {}).get("address", "").strip()
+
+        if not status:
+            continue
+
+        # chống trùng liên tiếp
+        key = f"{status}|{addr}"
+        if key == last_key:
+            continue
+
+        t = lg.get("action_at", "")
+        if t:
+            try:
+                t = datetime.fromisoformat(t.replace("Z", "")).strftime("%d/%m %H:%M")
+            except Exception:
+                t = t.replace("T", " ")[:16]
+
+        # GIỮ NGUYÊN CÂU CHỮ GHN
+        content = status
+        if addr and addr not in status:
+            content = f"{status} — {addr}"
+
+        timeline.append(f"🕔 {t} — {content}")
+        last_key = key
+
+        if len(timeline) >= max_steps:
+            break
+
+    if not timeline:
+        timeline.append("Chưa có lịch trình")
+
+    timeline_text = "\n".join(timeline)
+
+    # ===== OUTPUT =====
+    return (
+        f"📦 <b>{carrier}</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🔎 <b>MVĐ:</b> <code>{order_code}</code>\n"
+        f"📊 <b>Trạng thái:</b> {emoji} {status_name}\n"
+        f"🕒 <b>Dự kiến giao:</b> {eta}\n\n"
+        "📜 <b>Timeline (gần nhất):</b>\n"
+        f"{timeline_text}"
+    )
+
 
 # =========================================================
 # WEBHOOK HANDLER
@@ -993,7 +1170,11 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             main_keyboard()
         )
         return
-
+    # ----------GHN
+    if is_ghn_code(text):
+        result = check_ghn(text)
+        tg_send(chat_id, result)
+        return
 
 
     # ---------- USER CHECK ----------
