@@ -1444,9 +1444,294 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
     )
 
 # =========================================================
+# 📢 THÔNG BÁO SYSTEM (ADMIN ONLY) - 3 LỚP BẢO VỆ
+# =========================================================
+
+# Admin IDs (Tele ID của admin)
+ADMIN_IDS = [
+    1359771167,  # BonBonxHPx (từ ảnh sheet)
+    # Thêm admin khác ở đây
+]
+
+# =========================================================
+# BROADCAST STATE MANAGEMENT (Serverless-safe)
+# =========================================================
+IS_BROADCASTING = False  # Lock để chặn broadcast song song
+
+def get_broadcast_sheet():
+    """Get or create BroadcastState sheet"""
+    if not SHEET_READY:
+        return None
+    try:
+        try:
+            return sh.worksheet("BroadcastState")
+        except:
+            ws = sh.add_worksheet("BroadcastState", 100, 4)
+            ws.update('A1:D1', [['Timestamp', 'AdminID', 'Status', 'MessageID']])
+            return ws
+    except Exception as e:
+        print(f"[ERROR] get_broadcast_sheet: {e}")
+        return None
+
+def get_last_broadcast_time_from_sheet():
+    """Lấy thời gian broadcast gần nhất từ sheet"""
+    ws = get_broadcast_sheet()
+    if not ws:
+        return None
+    try:
+        all_values = ws.get_all_values()
+        if len(all_values) <= 1:  # Chỉ có header
+            return None
+        
+        # Tìm broadcast STARTED/COMPLETED gần nhất
+        for row in reversed(all_values[1:]):  # Skip header, đọc ngược
+            if row[2] in ["STARTED", "COMPLETED"]:
+                timestamp_str = row[0]
+                # Parse: "2025-12-31 16:46:00"
+                dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                return dt.timestamp()
+        
+        return None
+    except Exception as e:
+        print(f"[ERROR] get_last_broadcast_time_from_sheet: {e}")
+        return None
+
+def set_broadcast_state_to_sheet(admin_id, status, message_id=""):
+    """Lưu broadcast state vào sheet"""
+    ws = get_broadcast_sheet()
+    if not ws:
+        return False
+    try:
+        ws.append_row([
+            now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(admin_id),
+            status,
+            str(message_id)
+        ])
+        print(f"[BROADCAST] State saved: {status}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] set_broadcast_state_to_sheet: {e}")
+        return False
+
+def is_broadcast_message_processed(message_id):
+    """
+    ✅ LỚP 1: Check message_id đã từng broadcast chưa
+    Đây là lớp bảo vệ MẠNH NHẤT - chặn forward message cũ
+    """
+    if not message_id:
+        return False
+
+    ws = get_broadcast_sheet()
+    if not ws:
+        return False
+
+    try:
+        # Cột D = MessageID
+        col_message_ids = ws.col_values(4)
+        return str(message_id) in col_message_ids
+    except Exception as e:
+        print(f"[ERROR] is_broadcast_message_processed: {e}")
+        return False
+
+def check_broadcast_cooldown_from_sheet():
+    """
+    ✅ LỚP 2: Check cooldown từ sheet (serverless-safe)
+    Chặn gửi quá nhanh
+    """
+    last_time = get_last_broadcast_time_from_sheet()
+    if not last_time:
+        return True, 0  # OK to broadcast
+    
+    current_time = time.time()
+    time_since_last = current_time - last_time
+    
+    BROADCAST_COOLDOWN = 60  # 60 giây
+    
+    print(f"[BROADCAST] Time since last: {time_since_last:.1f}s")
+    
+    if time_since_last < BROADCAST_COOLDOWN:
+        wait_time = int(BROADCAST_COOLDOWN - time_since_last)
+        return False, wait_time
+    
+    return True, 0
+
+def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, message_id: int) -> None:
+    """
+    ✅ 3 LỚP BẢO VỆ CHỐNG GỬI LẶP:
+    1. Check message_id (chặn forward)
+    2. Cooldown 60s (chặn spam)
+    3. Broadcast lock (chặn song song)
+    """
+    global IS_BROADCASTING
+    
+    # 1. Kiểm tra quyền admin
+    if tele_id not in ADMIN_IDS:
+        tg_send(
+            chat_id,
+            "❌ <b>KHÔNG CÓ QUYỀN</b>\n\n"
+            "Chỉ admin mới được sử dụng lệnh này."
+        )
+        return
+    
+    # 2. Parse nội dung
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        tg_send(
+            chat_id,
+            "📢 <b>HƯỚNG DẪN GỬI THÔNG BÁO</b>\n\n"
+            "<b>Cú pháp:</b>\n"
+            "<code>/thongbao Nội dung thông báo</code>\n\n"
+            "<b>Ví dụ:</b>\n"
+            "<code>/thongbao Hệ thống bảo trì từ 22h-23h tối nay</code>\n\n"
+            "💡 <b>Lưu ý:</b>\n"
+            "• Hỗ trợ HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;\n"
+            "• Chống spam: 3 lớp bảo vệ tự động"
+        )
+        return
+    
+    message_content = parts[1].strip()
+    
+    # ✅ LỚP 1: CHECK MESSAGE_ID (MẠNH NHẤT!)
+    if is_broadcast_message_processed(message_id):
+        tg_send(
+            chat_id,
+            "⚠️ <b>THÔNG BÁO NÀY ĐÃ ĐƯỢC GỬI</b>\n\n"
+            "Bot đã tự động bỏ qua để tránh gửi lặp.\n\n"
+            "<i>Hệ thống phát hiện message_id trùng lặp.</i>"
+        )
+        print(f"[BROADCAST] ❌ BLOCKED - Duplicate message_id: {message_id}")
+        return
+    
+    # ✅ LỚP 2: CHECK COOLDOWN
+    can_broadcast, wait_time = check_broadcast_cooldown_from_sheet()
+    if not can_broadcast:
+        tg_send(
+            chat_id,
+            f"⏳ <b>VUI LÒNG ĐỢI {wait_time}s</b>\n\n"
+            f"🔒 Broadcast gần đây chưa đủ thời gian cooldown\n\n"
+            f"<i>Hệ thống tự động chống spam broadcast.</i>"
+        )
+        print(f"[BROADCAST] ❌ BLOCKED - Cooldown: {wait_time}s")
+        return
+    
+    # ✅ LỚP 3: BROADCAST LOCK (chặn chạy song song)
+    if IS_BROADCASTING:
+        tg_send(
+            chat_id,
+            "⛔ <b>ĐANG CÓ BROADCAST KHÁC CHẠY</b>\n\n"
+            "Vui lòng đợi broadcast trước hoàn tất."
+        )
+        print(f"[BROADCAST] ❌ BLOCKED - Already broadcasting")
+        return
+    
+    IS_BROADCASTING = True
+    
+    try:
+        # 4. Lấy danh sách users
+        try:
+            values = ws_user.get_all_values()
+        except Exception:
+            IS_BROADCASTING = False
+            tg_send(chat_id, "❌ Không thể đọc danh sách users từ Sheet")
+            return
+        
+        if not values or len(values) < 2:
+            IS_BROADCASTING = False
+            tg_send(chat_id, "❌ Không tìm thấy user nào trong Sheet")
+            return
+        
+        total_users = len(values) - 1  # Trừ header
+        
+        # 5. Lưu state STARTED
+        if not set_broadcast_state_to_sheet(tele_id, "STARTED", message_id):
+            IS_BROADCASTING = False
+            tg_send(chat_id, "❌ Lỗi khi lưu trạng thái broadcast")
+            return
+        
+        # 6. Preview message
+        tg_send(
+            chat_id,
+            f"📢 <b>ĐANG GỬI THÔNG BÁO...</b>\n\n"
+            f"👥 Tổng số users: <b>{total_users}</b>\n"
+            f"⏱️ Thời gian ước tính: ~{total_users * 0.1:.0f}s\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{message_content}\n"
+            f"━━━━━━━━━━━━━━━"
+        )
+        
+        # 7. Gửi broadcast
+        success_count = 0
+        fail_count = 0
+        sent_to = set()  # Track để tránh duplicate
+        
+        for idx, row in enumerate(values[1:], start=2):
+            if not row or len(row) < 1:
+                continue
+            
+            user_tele_id = safe_text(row[0])  # Cột A: Tele ID
+            if not user_tele_id or not user_tele_id.isdigit():
+                continue
+            
+            # Skip duplicate
+            if user_tele_id in sent_to:
+                print(f"[BROADCAST] Skip duplicate: {user_tele_id}")
+                continue
+            
+            try:
+                # Format message
+                full_message = (
+                    f"📢 <b>THÔNG BÁO TỪ ADMIN</b>\n"
+                    f"━━━━━━━━━━━━━━━\n\n"
+                    f"{message_content}\n\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"<i>Từ: NgânMiu.Store Bot System</i>"
+                )
+                
+                tg_send(user_tele_id, full_message)
+                sent_to.add(user_tele_id)
+                success_count += 1
+                
+                # Delay nhẹ
+                time.sleep(0.05)
+                
+            except Exception as e:
+                fail_count += 1
+                print(f"[BROADCAST] Failed to send to {user_tele_id}: {e}")
+        
+        # 8. Lưu state COMPLETED
+        set_broadcast_state_to_sheet(tele_id, "COMPLETED", message_id)
+        
+        # 9. Report kết quả
+        tg_send(
+            chat_id,
+            f"✅ <b>GỬI THÔNG BÁO HOÀN TẤT</b>\n\n"
+            f"📊 <b>Kết quả:</b>\n"
+            f"• Thành công: {success_count} users\n"
+            f"• Thất bại: {fail_count} users\n"
+            f"• Tổng cộng: {total_users} users"
+        )
+        
+        print(f"[BROADCAST] ✅ Completed: {success_count}/{total_users}")
+        
+    except Exception as e:
+        set_broadcast_state_to_sheet(tele_id, "FAILED", message_id)
+        tg_send(
+            chat_id,
+            f"❌ <b>LỖI GỬI THÔNG BÁO</b>\n\n{str(e)}"
+        )
+        print(f"[BROADCAST] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # 10. Mở khóa
+        IS_BROADCASTING = False
+
+# =========================================================
 # WEBHOOK HANDLER
 # =========================================================
-def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> None:
+def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: Dict[str, Any]) -> None:
     if text == "/start":
         tg_send(
             chat_id,
@@ -1454,6 +1739,15 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             "Chọn chức năng bên dưới 👇",
             main_keyboard()
         )
+        return
+    
+    # ========== THÔNG BÁO (ADMIN ONLY) ==========
+    if text.startswith("/thongbao"):
+        # Lấy message_id từ message object
+        msg_obj = data.get("message", {})
+        message_id = msg_obj.get("message_id", 0)
+        
+        handle_thongbao(chat_id, tele_id, username, text, message_id)
         return
 
     if text == "✅ Kích Hoạt":
@@ -1720,7 +2014,7 @@ def webhook_root():
         return "OK"
 
     try:
-        _handle_message(chat_id, tele_id, username, text)
+        _handle_message(chat_id, tele_id, username, text, data)  # ← Truyền data vào
     except Exception:
         err = traceback.format_exc()
         tg_send(chat_id, "❌ Bot gặp lỗi nội bộ, bạn gửi lại sau nhé.")
