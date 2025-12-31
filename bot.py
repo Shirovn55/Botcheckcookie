@@ -541,26 +541,45 @@ def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]
         # Lấy từ cache
         rows = get_all_users_cached()
         
+        # DEBUG: In ra header của row đầu tiên
+        if rows and len(rows) > 0:
+            print(f"[DEBUG] Sheet headers: {list(rows[0].keys())}")
+        
         for idx, r in enumerate(rows, start=2):
+            # DEBUG: In ra tất cả keys của row
+            if idx == 2:  # Chỉ in row đầu
+                print(f"[DEBUG] Row keys: {list(r.keys())}")
+                print(f"[DEBUG] Row data sample: {r}")
+            
             # So sánh Tele ID (cột A)
             row_tele_id = safe_text(
                 r.get("tele id") 
                 or r.get("Tele ID")
                 or r.get("TeleID")
+                or r.get("teleid")
             )
             
             if row_tele_id == tele_id:
+                # DEBUG: In ra user tìm thấy
+                print(f"[DEBUG] Found user {tele_id}: {r}")
+                
                 # Normalize user data
-                return idx, {
+                user_data = {
                     "Tele ID": row_tele_id,
                     "username": r.get("username") or r.get("Username") or "",
                     "balance": r.get("balance") or r.get("Balance") or 0,
-                    "trang thai": r.get("trang thai") or r.get("trạng thái") or r.get("Trang Thái") or "",
+                    "trang thai": r.get("trang thai") or r.get("trạng thái") or r.get("Trang Thái") or r.get("status") or "",
                     "ghi chu": r.get("ghi chu") or r.get("ghi chú") or r.get("Ghi Chú") or ""
                 }
+                
+                print(f"[DEBUG] Normalized user: {user_data}")
+                return idx, user_data
     except Exception as e:
         print(f"[ERROR] get_user_row: {e}")
+        import traceback
+        traceback.print_exc()
     
+    print(f"[DEBUG] User {tele_id} NOT FOUND in sheet")
     return None, None
 
 def get_balance(user: Dict[str, Any]) -> int:
@@ -1617,16 +1636,29 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             )
             return
 
-        if balance <= 0:
+        # ================= FREE LOGIC =================
+        # Balance > 10,000đ → Dùng FREE không giới hạn
+        # Balance ≤ 10,000đ → Giới hạn 10 lượt/ngày
+        
+        if balance > 10000:
+            # User có nhiều tiền → Dùng FREE không giới hạn
+            print(f"[FREE] User {tele_id} balance={balance:,}đ > 10,000đ → FREE unlimited")
+        else:
+            # User ít tiền → Giới hạn 10 lượt/ngày
             used = count_today_request(tele_id)
             if used >= FREE_LIMIT_PER_DAY:
                 tg_send(
                     chat_id,
                     "⚠️ <b>HẾT LƯỢT MIỄN PHÍ HÔM NAY</b>\n\n"
-                    f"📊 Đã dùng: {used}/{FREE_LIMIT_PER_DAY} request"
+                    f"📊 Đã dùng: {used}/{FREE_LIMIT_PER_DAY} lượt\n"
+                    f"💰 Số dư hiện tại: {balance:,}đ\n\n"
+                    f"💡 <b>Để dùng không giới hạn:</b>\n"
+                    f"👉 Nạp thêm để số dư > 10,000đ tại @nganmiu_bot"
                 )
                 return
+            print(f"[FREE] User {tele_id} balance={balance:,}đ ≤ 10,000đ → Free limited: {used}/{FREE_LIMIT_PER_DAY}")
 
+        # ================= DO CHECK =================
         if is_cookie(val):
             result, error = check_shopee_orders(val)
 
