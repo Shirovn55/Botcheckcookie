@@ -508,92 +508,99 @@ def ws_has_headers(ws, required: List[str]) -> bool:
 # USER CACHE (giữ nguyên)
 # =========================================================
 def get_all_users_cached():
-    """Cache danh sách users trong RAM"""
-    global user_cache
-    
-    current_time = time.time()
-    
-    if user_cache["data"] and (current_time - user_cache["timestamp"]) < CACHE_USERS_SECONDS:
-        return user_cache["data"]
-    
-    try:
-        all_users = ws_get_all_records_safe(ws_user)
-        user_cache["data"] = all_users
-        user_cache["timestamp"] = current_time
-        return all_users
-    except Exception:
-        return user_cache["data"] if user_cache["data"] else []
+    """
+    ⚠️ DEPRECATED: Không dùng nữa vì get_user_row đọc trực tiếp
+    Giữ lại để không break code khác
+    """
+    return []
 
 def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
     """
-    ✅ OPTIMIZED: Dùng cache + Đọc đúng cột Sheet
+    ✅ FIXED: Đọc theo INDEX cột thay vì tên (tránh lỗi header trùng)
     
-    Sheet structure:
-    - Cột A: Tele ID
-    - Cột B: username
-    - Cột C: balance
-    - Cột D: Trạng Thái (active)
-    - Cột E: ghi Chú (note/strike/band)
+    Sheet structure (by INDEX):
+    - Cột 0 (A): Tele ID
+    - Cột 1 (B): username
+    - Cột 2 (C): balance
+    - Cột 3 (D): Trạng Thái (active)
+    - Cột 4 (E): ghi Chú
+    - Cột 5 (F): ghi Chú (trùng tên)
     """
     tele_id = safe_text(tele_id)
     
     try:
-        # Lấy từ cache
-        rows = get_all_users_cached()
+        # Lấy RAW data từ cache (không dùng get_all_records vì có header trùng)
+        try:
+            values = ws_user.get_all_values()
+        except Exception:
+            return None, None
         
-        # DEBUG: In ra header của row đầu tiên
-        if rows and len(rows) > 0:
-            print(f"[DEBUG] Sheet headers: {list(rows[0].keys())}")
+        if not values or len(values) < 2:
+            return None, None
         
-        for idx, r in enumerate(rows, start=2):
-            # DEBUG: In ra tất cả keys của row
-            if idx == 2:  # Chỉ in row đầu
-                print(f"[DEBUG] Row keys: {list(r.keys())}")
-                print(f"[DEBUG] Row data sample: {r}")
+        # DEBUG: In headers
+        headers = values[0]
+        print(f"[DEBUG] Raw headers: {headers}")
+        
+        # Duyệt từng row (bỏ qua header)
+        for idx, row in enumerate(values[1:], start=2):
+            if not row or len(row) < 4:  # Cần ít nhất 4 cột
+                continue
             
-            # So sánh Tele ID (cột A)
-            row_tele_id = safe_text(
-                r.get("tele id") 
-                or r.get("Tele ID")
-                or r.get("TeleID")
-                or r.get("teleid")
-            )
+            # Đọc theo INDEX
+            row_tele_id = safe_text(row[0]) if len(row) > 0 else ""  # Cột A
+            row_username = safe_text(row[1]) if len(row) > 1 else ""  # Cột B
+            row_balance = safe_text(row[2]) if len(row) > 2 else "0"  # Cột C
+            row_status = safe_text(row[3]) if len(row) > 3 else ""    # Cột D
+            row_note = safe_text(row[4]) if len(row) > 4 else ""      # Cột E
             
+            # DEBUG: In row đầu tiên
+            if idx == 2:
+                print(f"[DEBUG] Sample row: {row}")
+                print(f"[DEBUG] Parsed: ID={row_tele_id}, user={row_username}, balance={row_balance}, status={row_status}")
+            
+            # So sánh Tele ID
             if row_tele_id == tele_id:
-                # DEBUG: In ra user tìm thấy
-                print(f"[DEBUG] Found user {tele_id}: {r}")
+                print(f"[DEBUG] ✅ Found user {tele_id} at row {idx}")
+                print(f"[DEBUG] Status value: '{row_status}'")
                 
-                # Normalize user data
+                # Return normalized data
                 user_data = {
                     "Tele ID": row_tele_id,
-                    "username": r.get("username") or r.get("Username") or "",
-                    "balance": r.get("balance") or r.get("Balance") or 0,
-                    "trang thai": r.get("trang thai") or r.get("trạng thái") or r.get("Trang Thái") or r.get("status") or "",
-                    "ghi chu": r.get("ghi chu") or r.get("ghi chú") or r.get("Ghi Chú") or ""
+                    "username": row_username,
+                    "balance": row_balance,
+                    "trang thai": row_status.lower().strip(),  # Normalize status
+                    "ghi chu": row_note
                 }
                 
                 print(f"[DEBUG] Normalized user: {user_data}")
                 return idx, user_data
+        
+        print(f"[DEBUG] ❌ User {tele_id} NOT FOUND in sheet")
+        
     except Exception as e:
-        print(f"[ERROR] get_user_row: {e}")
+        print(f"[ERROR] get_user_row exception: {e}")
         import traceback
         traceback.print_exc()
     
-    print(f"[DEBUG] User {tele_id} NOT FOUND in sheet")
     return None, None
 
 def get_balance(user: Dict[str, Any]) -> int:
     return safe_int(user.get("balance", 0))
 
 def get_note(row_idx: int) -> str:
+    """Đọc cột E (index 4) - ghi Chú/note/strike/band"""
     try:
-        return ws_user.cell(row_idx, COL_NOTE_INDEX).value or ""
+        # Cột E = index 5 (1-based) trong gspread
+        return ws_user.cell(row_idx, 5).value or ""
     except Exception:
         return ""
 
 def set_note(row_idx: int, value: str) -> None:
+    """Ghi cột E (index 4) - ghi Chú/note/strike/band"""
     try:
-        ws_user.update_cell(row_idx, COL_NOTE_INDEX, value)
+        # Cột E = index 5 (1-based) trong gspread
+        ws_user.update_cell(row_idx, 5, value)
     except Exception:
         pass
 
