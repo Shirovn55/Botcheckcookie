@@ -2,14 +2,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "bot_optimized_STEP1.py",
+      "src": "bot.py",  ← Sửa tên này
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "bot_optimized_STEP1.py"
+      "dest": "bot.py"  ← Sửa tên này
     }
   ],
   "regions": ["hkg1"]
