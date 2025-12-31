@@ -525,26 +525,42 @@ def get_all_users_cached():
         return user_cache["data"] if user_cache["data"] else []
 
 def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
-    """OPTIMIZED: Dùng cache"""
+    """
+    ✅ OPTIMIZED: Dùng cache + Đọc đúng cột Sheet
+    
+    Sheet structure:
+    - Cột A: Tele ID
+    - Cột B: username
+    - Cột C: balance
+    - Cột D: Trạng Thái (active)
+    - Cột E: ghi Chú (note/strike/band)
+    """
     tele_id = safe_text(tele_id)
     
     try:
-        if ws_has_headers(ws_user, ["Tele ID", "username", "balance"]):
-            rows = get_all_users_cached()
-            for idx, r in enumerate(rows, start=2):
-                if safe_text(r.get("Tele ID")) == tele_id or safe_text(r.get("tele id")) == tele_id:
-                    return idx, r
-    except Exception:
-        pass
-
-    raw = get_all_users_cached()
-    for idx, r in enumerate(raw, start=2):
-        if safe_text(r.get("tele id")) == tele_id:
-            return idx, {
-                "Tele ID": r.get("tele id"),
-                "username": r.get("username"),
-                "balance": r.get("balance"),
-            }
+        # Lấy từ cache
+        rows = get_all_users_cached()
+        
+        for idx, r in enumerate(rows, start=2):
+            # So sánh Tele ID (cột A)
+            row_tele_id = safe_text(
+                r.get("tele id") 
+                or r.get("Tele ID")
+                or r.get("TeleID")
+            )
+            
+            if row_tele_id == tele_id:
+                # Normalize user data
+                return idx, {
+                    "Tele ID": row_tele_id,
+                    "username": r.get("username") or r.get("Username") or "",
+                    "balance": r.get("balance") or r.get("Balance") or 0,
+                    "trang thai": r.get("trang thai") or r.get("trạng thái") or r.get("Trang Thái") or "",
+                    "ghi chu": r.get("ghi chu") or r.get("ghi chú") or r.get("Ghi Chú") or ""
+                }
+    except Exception as e:
+        print(f"[ERROR] get_user_row: {e}")
+    
     return None, None
 
 def get_balance(user: Dict[str, Any]) -> int:
@@ -1421,22 +1437,29 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             tg_send(
                 chat_id,
                 "❌ <b>CHƯA KÍCH HOẠT</b>\n\n"
+                f"🆔 <b>Tele ID của bạn:</b> <code>{tele_id}</code>\n\n"
                 "👉 Vui lòng kích hoạt tại bot lưu voucher trước:\n"
                 "🎟️ @nganmiu_bot",
                 main_keyboard()
             )
             return
 
+        # Lấy cột "Trạng Thái" (có thể là "trang thai" hoặc "trạng thái")
         status = safe_text(
-            user.get("status")
+            user.get("trang thai")  # Cột D: "Trạng Thái"
             or user.get("trạng thái")
-            or user.get("active")
-        ).lower()
+            or user.get("Trang Thái")
+            or user.get("status")
+        ).lower().strip()
 
         if status == "active":
+            balance = get_balance(user)
             tg_send(
                 chat_id,
                 "✅ <b>TÀI KHOẢN ĐÃ KÍCH HOẠT</b>\n\n"
+                f"🆔 <b>Tele ID:</b> <code>{tele_id}</code>\n"
+                f"👤 <b>Username:</b> {user.get('username') or '(chưa có)'}\n"
+                f"💰 <b>Số dư:</b> {balance:,}đ\n\n"
                 "Bạn có thể sử dụng bot bình thường 🚀",
                 main_keyboard()
             )
@@ -1445,6 +1468,8 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         tg_send(
             chat_id,
             "❌ <b>CHƯA KÍCH HOẠT</b>\n\n"
+            f"🆔 <b>Tele ID của bạn:</b> <code>{tele_id}</code>\n"
+            f"📊 <b>Trạng thái:</b> {status or '(trống)'}\n\n"
             "👉 Hãy kích hoạt tại bot lưu voucher:\n"
             "🎟️ @nganmiu_bot",
             main_keyboard()
