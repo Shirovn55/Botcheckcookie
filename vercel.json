@@ -11,6 +11,5 @@
       "src": "/(.*)",
       "dest": "bot.py"
     }
-  ],
-  "regions": ["hkg1"]
+  ]
 }
