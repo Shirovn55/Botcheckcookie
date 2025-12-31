@@ -2,15 +2,15 @@
   "version": 2,
   "builds": [
     {
-      "src": "bot.py",
+      "src": "bot_optimized_STEP1.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "bot.py"
+      "dest": "bot_optimized_STEP1.py"
     }
   ],
-  "regions": ["hkg"]
+  "regions": ["hkg1"]
 }
