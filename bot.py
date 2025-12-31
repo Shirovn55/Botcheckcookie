@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NgânMiu.Store — BOT CHECK ĐƠN HÀNG SHOPEE + TRA MÃ VẬN ĐƠN SPX
+NgânMiu.Store — BOT CHECK ĐƠN HÀNG SHOPEE + TRA MÃ VẬN ĐƠNx SPX
 ✅ STEP 1 OPTIMIZATION: Cache Cookie + Batch Log + Timeout tối ưu
 """
 
