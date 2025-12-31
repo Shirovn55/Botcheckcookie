@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NgânMiu.Store — BOT CHECK ĐƠN HÀNG SHOPEE + TRA MÃ VẬN ĐƠN SPX
-✅ FIX: Dùng ĐÚNG API từ app.py (đang chạy ngon)
+✅ STEP 1 OPTIMIZATION: Cache Cookie + Batch Log + Timeout tối ưu
 """
 
 import os
@@ -10,10 +10,12 @@ import json
 import time
 import html
 import traceback
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 import requests
 from flask import Flask, request, jsonify
@@ -41,18 +43,34 @@ if not CREDS_JSON:
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================================================
-# OPTIMIZATION CONFIG - NHANH GẤP 3-5 LẦN
+# 🔥 STEP 1 OPTIMIZATION CONFIG
 # =========================================================
 print("="*60)
-print(" BOT OPTIMIZED - Quick Fix Active")
+print(" BOT OPTIMIZED - STEP 1: CACHE + BATCH + TIMEOUT")
 print("="*60)
 
-USE_PARALLEL = os.getenv("USE_PARALLEL", "false").lower() == "true"
+USE_PARALLEL = os.getenv("USE_PARALLEL", "true").lower() == "true"
 CHECK_LIMIT = 3
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
 
-print(f"[PERF] Mode: {'PARALLEL' if USE_PARALLEL else 'SEQUENTIAL (Quick Fix)'}")
-print(f"[PERF] Check: {CHECK_LIMIT} orders | Timeout optimized")
+# ✅ FIX 1: GIẢM TIMEOUT (từ 8s/6s → 5s/4s)
+TIMEOUT_LIST = 5    # Giảm từ 8s
+TIMEOUT_DETAIL = 4  # Giảm từ 6s
+TIMEOUT_RETRY = 1   # Số lần retry khi timeout
+
+# ✅ FIX 2: CACHE COOKIE (mới)
+CACHE_COOKIE_TTL = int(os.getenv("CACHE_COOKIE_TTL", "45"))  # 45 giây
+order_cache = {}  # {cookie: {"data": [...], "time": timestamp}}
+
+# ✅ FIX 3: BATCH LOG (mới)
+LOG_BATCH_SIZE = int(os.getenv("LOG_BATCH_SIZE", "10"))     # Gom 10 dòng
+LOG_BATCH_INTERVAL = int(os.getenv("LOG_BATCH_INTERVAL", "3"))  # Hoặc 3 giây
+log_queue = Queue()
+
+print(f"[PERF] Mode: {'✅ PARALLEL' if USE_PARALLEL else '⚠️ SEQUENTIAL'}")
+print(f"[PERF] Timeout: list={TIMEOUT_LIST}s, detail={TIMEOUT_DETAIL}s, retry={TIMEOUT_RETRY}")
+print(f"[PERF] ✅ Cache cookie: {CACHE_COOKIE_TTL}s")
+print(f"[PERF] ✅ Batch log: {LOG_BATCH_SIZE} rows or {LOG_BATCH_INTERVAL}s")
 
 # Payment Integration
 BOT1_API_URL = os.getenv("BOT1_API_URL", "").strip()
@@ -65,52 +83,15 @@ else:
     PRICE_CHECK_COOKIE = PRICE_CHECK_SPX = PRICE_CHECK_GHN = 0
     print("[PAYMENT] Disabled")
 
+# User cache (giữ nguyên từ version trước)
+CACHE_USERS_SECONDS = int(os.getenv("CACHE_USERS_SECONDS", "60"))
+user_cache = {
+    "data": None,
+    "timestamp": 0
+}
+print(f"[PERF] ✅ Cache users: {CACHE_USERS_SECONDS}s")
+
 print("="*60)
-
-# =========================================================
-# PERFORMANCE OPTIMIZATION CONFIG
-# =========================================================
-print("=" * 60)
-print(" PERFORMANCE CONFIG")
-print("=" * 60)
-
-# Phase 1: Quick Fix (Deploy ngay)
-USE_PARALLEL = os.getenv("USE_PARALLEL", "false").lower() == "true"
-CHECK_LIMIT = int(os.getenv("CHECK_LIMIT", "3"))  # Default 3 đơn
-
-# Phase 2: Parallel Config
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Default 3 workers
-
-# Timeout Config
-TIMEOUT_LIST = 8    # Giảm từ 20s
-TIMEOUT_DETAIL = 6  # Giảm từ 15s
-
-print(f"[PERF] Mode: {'PARALLEL' if USE_PARALLEL else 'SEQUENTIAL'}")
-print(f"[PERF] Check limit: {CHECK_LIMIT} orders")
-print(f"[PERF] Max workers: {MAX_WORKERS}")
-print(f"[PERF] Timeout: list={TIMEOUT_LIST}s, detail={TIMEOUT_DETAIL}s")
-
-# =========================================================
-# BOT 1 PAYMENT INTEGRATION
-# =========================================================
-BOT1_API_URL = os.getenv("BOT1_API_URL", "").strip()
-
-if BOT1_API_URL:
-    print(f"[PAYMENT] Bot 1 API: {BOT1_API_URL}")
-    
-    # Pricing
-    PRICE_CHECK_COOKIE = int(os.getenv("PRICE_CHECK_COOKIE", "10"))
-    PRICE_CHECK_SPX = int(os.getenv("PRICE_CHECK_SPX", "10"))
-    PRICE_CHECK_GHN = int(os.getenv("PRICE_CHECK_GHN", "10"))
-    
-    print(f"[PAYMENT] Price: {PRICE_CHECK_COOKIE}đ per check")
-else:
-    print("[PAYMENT] Disabled (BOT1_API_URL not set)")
-    PRICE_CHECK_COOKIE = 0
-    PRICE_CHECK_SPX = 0
-    PRICE_CHECK_GHN = 0
-
-print("=" * 60)
 
 # =========================================================
 # GOOGLE SHEET CONNECT
@@ -136,7 +117,7 @@ TAB_USERS       = "Thanh Toan"
 TAB_LOGS_CHECK  = "LogsCheck"
 TAB_LOGS_SPAM   = "LogsSpam"
 
-COL_NOTE_INDEX  = 5   # cột E (1-based) – note/strike/band
+COL_NOTE_INDEX  = 5
 
 # =========================================================
 # LIMIT CONFIG
@@ -176,6 +157,107 @@ def safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+# =========================================================
+# 🔥 FIX 2: CACHE COOKIE FUNCTIONS
+# =========================================================
+def get_cached_orders(cookie: str):
+    """Lấy kết quả đã cache theo cookie"""
+    item = order_cache.get(cookie)
+    if not item:
+        return None
+    
+    # Kiểm tra TTL
+    if time.time() - item["time"] > CACHE_COOKIE_TTL:
+        # Cache hết hạn
+        del order_cache[cookie]
+        return None
+    
+    return item["data"]
+
+def set_cached_orders(cookie: str, data):
+    """Lưu kết quả vào cache"""
+    order_cache[cookie] = {
+        "data": data,
+        "time": time.time()
+    }
+
+def clear_expired_cache():
+    """Dọn cache cũ (chạy định kỳ)"""
+    current_time = time.time()
+    expired = [
+        k for k, v in order_cache.items()
+        if current_time - v["time"] > CACHE_COOKIE_TTL
+    ]
+    for k in expired:
+        del order_cache[k]
+
+# =========================================================
+# 🔥 FIX 3: BATCH LOG WORKER
+# =========================================================
+def log_worker():
+    """
+    Worker thread xử lý batch ghi log
+    Gom log → Ghi 1 lần khi:
+    - Đủ LOG_BATCH_SIZE dòng
+    - Hoặc sau LOG_BATCH_INTERVAL giây
+    """
+    buffer_check = []
+    buffer_spam = []
+    last_flush = time.time()
+    
+    print("[LOG] Batch log worker started")
+    
+    while True:
+        try:
+            # Lấy item từ queue (timeout 0.5s)
+            item = log_queue.get(timeout=0.5)
+            
+            log_type = item.get("type")
+            data = item.get("data")
+            
+            if log_type == "check":
+                buffer_check.append(data)
+            elif log_type == "spam":
+                buffer_spam.append(data)
+                
+        except:
+            # Timeout → Không có item mới
+            pass
+        
+        # Kiểm tra điều kiện flush
+        current_time = time.time()
+        should_flush = (
+            len(buffer_check) >= LOG_BATCH_SIZE or
+            len(buffer_spam) >= LOG_BATCH_SIZE or
+            (current_time - last_flush) >= LOG_BATCH_INTERVAL
+        )
+        
+        if should_flush:
+            # Flush buffer_check
+            if buffer_check:
+                try:
+                    ws_log_check.append_rows(
+                        buffer_check,
+                        value_input_option="USER_ENTERED"
+                    )
+                    print(f"[LOG] Flushed {len(buffer_check)} check logs")
+                except Exception as e:
+                    print(f"[LOG] Error flushing check: {e}")
+                buffer_check.clear()
+            
+            # Flush buffer_spam
+            if buffer_spam:
+                try:
+                    ws_log_spam.append_rows(
+                        buffer_spam,
+                        value_input_option="USER_ENTERED"
+                    )
+                    print(f"[LOG] Flushed {len(buffer_spam)} spam logs")
+                except Exception as e:
+                    print(f"[LOG] Error flushing spam: {e}")
+                buffer_spam.clear()
+            
+            last_flush = current_time
 
 # =========================================================
 # BOT 1 API INTEGRATION
@@ -183,7 +265,7 @@ def safe_int(v: Any, default: int = 0) -> int:
 def check_balance_bot1(user_id: int) -> tuple:
     """Check user balance from Bot 1"""
     if not BOT1_API_URL:
-        return True, 999999, ""  # Bypass if not configured
+        return True, 999999, ""
     
     try:
         response = requests.post(
@@ -203,7 +285,7 @@ def check_balance_bot1(user_id: int) -> tuple:
 def deduct_balance_bot1(user_id: int, amount: int, reason: str, username: str = "") -> tuple:
     """Deduct money from Bot 1"""
     if not BOT1_API_URL:
-        return True, 999999, ""  # Bypass if not configured
+        return True, 999999, ""
     
     try:
         response = requests.post(
@@ -237,25 +319,19 @@ def format_insufficient_balance_msg(balance: int, required: int) -> str:
     )
 
 def check_shopee_orders_with_payment(cookie: str, user_id: int, username: str = "") -> tuple:
-    """
-    Check Shopee orders with auto payment
-    Returns: (success: bool, result_text: str, balance_after: int)
-    """
-    # 1. Check balance
+    """Check Shopee orders with auto payment"""
     if BOT1_API_URL:
         success, balance, error = check_balance_bot1(user_id)
         
         if not success:
             return False, f"⚠️ Lỗi hệ thống: {error}", 0
         
-        # 2. Check sufficient
         if balance < PRICE_CHECK_COOKIE:
             msg = format_insufficient_balance_msg(balance, PRICE_CHECK_COOKIE)
             return False, msg, balance
     else:
         balance = 0
     
-    # 3. Perform check
     result_html, result_text = check_shopee_orders(cookie)
     
     if not result_html or result_text:
@@ -266,7 +342,6 @@ def check_shopee_orders_with_payment(cookie: str, user_id: int, username: str = 
             error_msg = "📭 Không có đơn hàng nào"
         return False, error_msg, balance
     
-    # 4. Deduct money
     if BOT1_API_URL:
         success, new_balance, error = deduct_balance_bot1(
             user_id, PRICE_CHECK_COOKIE, "Check cookie Shopee", username
@@ -275,7 +350,6 @@ def check_shopee_orders_with_payment(cookie: str, user_id: int, username: str = 
         if not success:
             return True, f"{result_html}\n\n⚠️ Không trừ được tiền: {error}", balance
         
-        # 5. Format result with balance
         final = (
             f"{result_html}\n\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -355,6 +429,7 @@ def is_cookie(val: str) -> bool:
 
 def is_spx(val: str) -> bool:
     return re.fullmatch(r"SPXVN[0-9A-Z]+", val.strip()) is not None
+
 def is_ghn_code(text: str) -> bool:
     t = text.strip().upper()
     return t.startswith(("GHN", "GYP")) or (t.isdigit() and len(t) >= 8)
@@ -430,20 +505,39 @@ def ws_has_headers(ws, required: List[str]) -> bool:
     return all((_normalize_header(x) in norm) for x in required)
 
 # =========================================================
-# USER DATA
+# USER CACHE (giữ nguyên)
 # =========================================================
+def get_all_users_cached():
+    """Cache danh sách users trong RAM"""
+    global user_cache
+    
+    current_time = time.time()
+    
+    if user_cache["data"] and (current_time - user_cache["timestamp"]) < CACHE_USERS_SECONDS:
+        return user_cache["data"]
+    
+    try:
+        all_users = ws_get_all_records_safe(ws_user)
+        user_cache["data"] = all_users
+        user_cache["timestamp"] = current_time
+        return all_users
+    except Exception:
+        return user_cache["data"] if user_cache["data"] else []
+
 def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    """OPTIMIZED: Dùng cache"""
     tele_id = safe_text(tele_id)
+    
     try:
         if ws_has_headers(ws_user, ["Tele ID", "username", "balance"]):
-            rows = ws_user.get_all_records()
+            rows = get_all_users_cached()
             for idx, r in enumerate(rows, start=2):
-                if safe_text(r.get("Tele ID")) == tele_id:
+                if safe_text(r.get("Tele ID")) == tele_id or safe_text(r.get("tele id")) == tele_id:
                     return idx, r
     except Exception:
         pass
 
-    raw = ws_get_all_records_safe(ws_user)
+    raw = get_all_users_cached()
     for idx, r in enumerate(raw, start=2):
         if safe_text(r.get("tele id")) == tele_id:
             return idx, {
@@ -515,17 +609,18 @@ def inc_strike_and_band(row_idx: int, tele_id: Any, username: str, count_minute:
     new_note = f"strike:{strike}|band:{band_until.strftime('%Y-%m-%d %H:%M')}"
     set_note(row_idx, new_note)
 
-    try:
-        ws_log_spam.append_row([
+    # ✅ BATCH LOG: Đẩy vào queue thay vì ghi trực tiếp
+    log_queue.put({
+        "type": "spam",
+        "data": [
             now().strftime("%Y-%m-%d %H:%M:%S"),
             safe_text(tele_id),
             username or "",
             count_minute,
             strike,
             band_text
-        ], value_input_option="USER_ENTERED")
-    except Exception:
-        pass
+        ]
+    })
 
     return strike, band_until
 
@@ -533,17 +628,18 @@ def inc_strike_and_band(row_idx: int, tele_id: Any, username: str, count_minute:
 # LOG CHECK + COUNT
 # =========================================================
 def log_check(tele_id: Any, username: str, value: str, balance_after: int, note: str) -> None:
-    try:
-        ws_log_check.append_row([
+    """✅ BATCH LOG: Đẩy vào queue"""
+    log_queue.put({
+        "type": "check",
+        "data": [
             now().strftime("%Y-%m-%d %H:%M:%S"),
             safe_text(tele_id),
             username or "",
             mask_value(value),
             balance_after,
             note
-        ], value_input_option="USER_ENTERED")
-    except Exception:
-        pass
+        ]
+    })
 
 def count_today_request(tele_id: Any) -> int:
     tele_id = safe_text(tele_id)
@@ -597,6 +693,7 @@ def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
         )
     except Exception:
         pass
+
 def main_keyboard():
     return {
         "keyboard": [
@@ -606,7 +703,6 @@ def main_keyboard():
         ],
         "resize_keyboard": True
     }
-
 
 # =========================================================
 # CALLBACK HANDLER
@@ -678,8 +774,9 @@ def handle_callback_query(data: Dict[str, Any]) -> None:
             "<code>SPXVN05805112503C</code>"
         )
         return
+
 # =========================================================
-# STATUS ALIAS (ĐỒNG BỘ app.py)
+# STATUS ALIAS
 # =========================================================
 GHN_STATUS_EMOJI = {
     "Chờ lấy hàng": "🕓",
@@ -695,61 +792,34 @@ GHN_STATUS_EMOJI = {
 }
 
 CODE_MAP = {
-    # ===== GIAO THÀNH CÔNG =====
     "order_status_text_to_receive_delivery_done": ("✅ Giao hàng thành công", "success"),
     "order_tooltip_to_receive_delivery_done":     ("✅ Giao hàng thành công", "success"),
     "label_order_delivered":                      ("✅ Giao hàng thành công", "success"),
-
-    # ===== ĐANG CHỜ NHẬN =====
     "order_list_text_to_receive_non_cod":         ("🚚 Đang chờ nhận (không COD)", "info"),
     "label_to_receive":                           ("🚚 Đang chờ nhận", "info"),
     "label_order_to_receive":                     ("🚚 Đang chờ nhận", "info"),
-
-    # ===== CHỜ GIAO / ĐANG CHUẨN BỊ =====
     "label_order_to_ship":                        ("📦 Chờ giao hàng", "warning"),
     "label_order_being_packed":                   ("📦 Đang chuẩn bị hàng", "warning"),
     "label_order_processing":                     ("🔄 Đang xử lý", "warning"),
-
-    # ===== THANH TOÁN / VẬN CHUYỂN =====
     "label_order_paid":                           ("💰 Đã thanh toán", "info"),
     "label_order_unpaid":                         ("💸 Chưa thanh toán", "info"),
     "label_order_waiting_shipment":               ("📦 Chờ bàn giao vận chuyển", "info"),
     "label_order_shipped":                        ("🚛 Đã bàn giao vận chuyển", "info"),
-
-    # ===== LỖI / HỦY =====
     "label_order_delivery_failed":                ("❌ Giao không thành công", "danger"),
     "label_order_cancelled":                      ("❌ Đã hủy", "danger"),
     "label_order_return_refund":                  ("↩️ Trả hàng / Hoàn tiền", "info"),
-
-    # ===== SHOPEE DUYỆT =====
-    "order_list_text_to_ship_ship_by_date_not_calculated": (
-        "🎖 Đơn hàng chờ Shopee duyệt", "warning"
-    ),
-    "order_status_text_to_ship_ship_by_date_not_calculated": (
-        "🎖 Đơn hàng chờ Shopee duyệt", "warning"
-    ),
-    "label_ship_by_date_not_calculated": (
-        "🎖 Đơn hàng chờ Shopee duyệt", "warning"
-    ),
-
-    # ===== SHOP CHUẨN BỊ =====
+    "order_list_text_to_ship_ship_by_date_not_calculated": ("🎖 Đơn hàng chờ Shopee duyệt", "warning"),
+    "order_status_text_to_ship_ship_by_date_not_calculated": ("🎖 Đơn hàng chờ Shopee duyệt", "warning"),
+    "label_ship_by_date_not_calculated": ("🎖 Đơn hàng chờ Shopee duyệt", "warning"),
     "label_preparing_order":                      ("📦 Chờ shop gửi hàng", "warning"),
     "order_list_text_to_ship_order_shipbydate":   ("📦 Chờ shop gửi hàng", "warning"),
     "order_status_text_to_ship_order_shipbydate": ("📦 Người gửi đang chuẩn bị hàng", "warning"),
-    "order_list_text_to_ship_order_shipbydate_cod": (
-        "📦 Chờ shop gửi hàng (COD)", "warning"
-    ),
-    "order_status_text_to_ship_order_shipbydate_cod": (
-        "📦 Chờ shop gửi hàng (COD)", "warning"
-    ),
-    "order_status_text_to_ship_order_edt_cod": (
-        "📦 Chờ shop gửi hàng (COD)", "warning"
-    ),
+    "order_list_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
+    "order_status_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
+    "order_status_text_to_ship_order_edt_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
 }
+
 def normalize_status_text(status: str) -> str:
-    """
-    Chuẩn hóa text trạng thái (bỏ 'Tình trạng:' + emoji dư)
-    """
     if not isinstance(status, str):
         return ""
     s = status.strip()
@@ -757,7 +827,7 @@ def normalize_status_text(status: str) -> str:
     return s.strip()
 
 # =========================================================
-# 🔥 SHOPEE CHECK (ĐÚNG LOGIC TỪ app.py)
+# SHOPEE CHECK
 # =========================================================
 UA = "Android app Shopee appver=28320 app_type=1"
 SHOPEE_BASE = "https://shopee.vn/api/v4"
@@ -771,7 +841,6 @@ def build_headers(cookie: str) -> dict:
     }
 
 def find_first_key(data, key):
-    """Tìm key đầu tiên trong nested dict/list (BFS)"""
     dq = deque([data])
     while dq:
         cur = dq.popleft()
@@ -784,7 +853,6 @@ def find_first_key(data, key):
     return None
 
 def bfs_values_by_key(data, target_keys=("order_id",)):
-    """Lấy tất cả giá trị của key trong nested structure"""
     out, dq, tset = [], deque([data]), set(target_keys)
     while dq:
         cur = dq.popleft()
@@ -799,7 +867,6 @@ def bfs_values_by_key(data, target_keys=("order_id",)):
     return out
 
 def fmt_ts(ts):
-    """Format timestamp"""
     if isinstance(ts, str) and ts.isdigit():
         ts = int(ts)
     if isinstance(ts, (int, float)) and ts > 1_000_000:
@@ -810,51 +877,65 @@ def fmt_ts(ts):
     return str(ts) if ts is not None else None
 
 # =========================================================
-# OPTIMIZATION: FETCH SINGLE ORDER DETAIL
+# ✅ FIX 1: TIMEOUT + RETRY
 # =========================================================
 def fetch_single_order_detail(order_id: str, headers: dict) -> Optional[dict]:
-    """
-    Fetch chi tiết 1 order
-    Dùng cho cả sequential và parallel
-    """
-    try:
-        r = requests.get(
-            f"{SHOPEE_BASE}/order/get_order_detail",
-            headers=headers,
-            params={"order_id": order_id},
-            timeout=TIMEOUT_DETAIL
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+    """Fetch chi tiết 1 order với retry"""
+    url = f"{SHOPEE_BASE}/order/get_order_detail"
+    
+    for attempt in range(TIMEOUT_RETRY + 1):
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                params={"order_id": order_id},
+                timeout=TIMEOUT_DETAIL  # 4s
+            )
+            if r.status_code == 200:
+                return r.json()
+        except requests.exceptions.Timeout:
+            if attempt < TIMEOUT_RETRY:
+                continue  # Retry
+            return None
+        except Exception:
+            return None
+    
     return None
 
 # =========================================================
-# OPTIMIZATION: PARALLEL VERSION
+# PARALLEL VERSION
 # =========================================================
 def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
-    """
-    PARALLEL VERSION - Nhanh gấp 3-5 lần
-    """
+    """PARALLEL VERSION với timeout mới"""
     headers = build_headers(cookie)
     list_url = f"{SHOPEE_BASE}/order/get_all_order_and_checkout_list"
     
     # Step 1: Lấy list orders
-    try:
-        r = requests.get(
-            list_url,
-            headers=headers,
-            params={"limit": limit, "offset": 0},
-            timeout=TIMEOUT_LIST
-        )
-        
-        if r.status_code != 200:
-            return None, f"http_{r.status_code}"
-        
-        data = r.json()
-    except Exception as e:
-        return None, f"timeout: {e}"
+    for attempt in range(TIMEOUT_RETRY + 1):
+        try:
+            r = requests.get(
+                list_url,
+                headers=headers,
+                params={
+                    "limit": limit,
+                    "offset": 0,
+                    "need_order_response": 1,  # ✅ FIX 4: Giảm payload
+                    "need_shipping_info": 0
+                },
+                timeout=TIMEOUT_LIST  # 5s
+            )
+            
+            if r.status_code == 200:
+                data = r.json()
+                break
+        except requests.exceptions.Timeout:
+            if attempt < TIMEOUT_RETRY:
+                continue
+            return None, "timeout"
+        except Exception as e:
+            return None, f"error: {e}"
+    else:
+        return None, "timeout"
     
     # Cookie validation
     if isinstance(data, dict):
@@ -884,13 +965,11 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
     details = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
         future_to_oid = {
             executor.submit(fetch_single_order_detail, oid, headers): oid 
             for oid in uniq[:limit]
         }
         
-        # Collect results
         for future in as_completed(future_to_oid, timeout=TIMEOUT_DETAIL + 2):
             try:
                 result = future.result(timeout=1)
@@ -905,18 +984,14 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
     return details, None
 
 def fetch_orders_and_details(cookie: str, limit: int = None):
-    """
-    OPTIMIZED: Smart dispatcher - Chọn sequential hoặc parallel
-    Nhanh gấp 3-5 lần so với version cũ
-    """
+    """Smart dispatcher"""
     if limit is None:
         limit = CHECK_LIMIT
     
-    # Dispatch to parallel or sequential
     if USE_PARALLEL:
         return fetch_orders_and_details_parallel(cookie, limit)
     
-    # Sequential mode (optimized với timeout mới)
+    # Sequential mode
     headers = build_headers(cookie)
     list_url = f"{SHOPEE_BASE}/order/get_all_order_and_checkout_list"
     
@@ -924,8 +999,13 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
         r = requests.get(
             list_url,
             headers=headers,
-            params={"limit": limit, "offset": 0},
-            timeout=TIMEOUT_LIST  # OPTIMIZED: 8s thay vì 20s
+            params={
+                "limit": limit,
+                "offset": 0,
+                "need_order_response": 1,  # ✅ Giảm payload
+                "need_shipping_info": 0
+            },
+            timeout=TIMEOUT_LIST
         )
         
         if r.status_code != 200:
@@ -935,7 +1015,6 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
     except Exception as e:
         return None, f"timeout: {e}"
     
-    # Cookie validation
     if isinstance(data, dict):
         if (
             data.get("error") in (401, 403)
@@ -944,7 +1023,6 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
         ):
             return None, "cookie_expired"
     
-    # Parse order IDs
     order_ids = bfs_values_by_key(data, ("order_id",)) if isinstance(data, dict) else []
     
     if not order_ids:
@@ -952,14 +1030,12 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
             return None, "cookie_expired"
         return None, "no_orders"
     
-    # Remove duplicates
     seen, uniq = set(), []
     for oid in order_ids:
         if oid not in seen:
             seen.add(oid)
             uniq.append(oid)
     
-    # Fetch details (sequential với helper function)
     details = []
     for oid in uniq[:limit]:
         detail = fetch_single_order_detail(oid, headers)
@@ -972,7 +1048,7 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
     return details, None
 
 def format_order_simple(detail: dict) -> str:
-    """Format đơn hàng Shopee – card mềm, đẹp trên mobile"""
+    """Format đơn hàng Shopee"""
 
     def short_text(s: str, max_len: int) -> str:
         s = (s or "").strip()
@@ -980,14 +1056,12 @@ def format_order_simple(detail: dict) -> str:
             return s
         return s[:max_len - 3].rstrip() + "..."
 
-    # ===== MVĐ =====
     tracking = (
         find_first_key(detail, "tracking_no")
         or find_first_key(detail, "tracking_number")
         or "-"
     )
 
-    # ===== TRẠNG THÁI (ƯU TIÊN TIMELINE) =====
     status_text = "-"
     tracking_info = find_first_key(detail, "tracking_info")
     if isinstance(tracking_info, dict):
@@ -1017,7 +1091,6 @@ def format_order_simple(detail: dict) -> str:
         st2, _ = map_code(raw_status)
         status_text = st2 or raw_status or "-"
 
-    # ===== COD =====
     cod_amount = 0
     try:
         cod_amount = (
@@ -1030,7 +1103,6 @@ def format_order_simple(detail: dict) -> str:
     except Exception:
         cod_amount = 0
 
-    # ===== SẢN PHẨM =====
     product_names = []
     items = find_first_key(detail, "item_list") or find_first_key(detail, "items")
     if isinstance(items, list):
@@ -1049,7 +1121,6 @@ def format_order_simple(detail: dict) -> str:
 
     product_text = short_text(product_text, 68)
 
-    # ===== NGƯỜI NHẬN =====
     rec_addr = find_first_key(detail, "recipient_address") or {}
     if not isinstance(rec_addr, dict):
         rec_addr = {}
@@ -1071,11 +1142,9 @@ def format_order_simple(detail: dict) -> str:
     )
     address = short_text(address, 78)
 
-    # ===== SHIPPER =====
     shipper_name = find_first_key(detail, "driver_name") or "-"
     shipper_phone = find_first_key(detail, "driver_phone") or "-"
 
-    # ===== OUTPUT =====
     output = (
         "🧾 <u><b>ĐƠN HÀNG</b></u>\n"
         f"📦 <b>MVĐ:</b> <code>{esc(tracking)}</code>\n"
@@ -1096,59 +1165,59 @@ def format_order_simple(detail: dict) -> str:
         "<i>ℹ️ Tap vào MVĐ để copy nhanh.</i>"
     )
 
-
-
     return output
 
-
-
 def map_code(code):
-    """Map status code sang text + color"""
     if not isinstance(code, str):
         return None, "secondary"
     return CODE_MAP.get(code, (code, "secondary"))
 
 def check_shopee_orders(cookie: str) -> Tuple[Optional[str], Optional[str]]:
-    """OPTIMIZED: Check Shopee orders - Nhanh gấp 3-5 lần"""
+    """✅ CACHE COOKIE: Check với cache"""
     cookie = cookie.strip()
     if "SPC_ST=" not in cookie:
         return None, "missing_spc_st"
 
-    details, error = fetch_orders_and_details(cookie)  # OPTIMIZED: Dùng CHECK_LIMIT
+    # ✅ Kiểm tra cache trước
+    cached = get_cached_orders(cookie)
+    if cached:
+        print(f"[CACHE] HIT cookie: {cookie[:20]}...")
+        # Format từ cache
+        blocks = []
+        for d in cached:
+            if isinstance(d, dict):
+                block = format_order_simple(d)
+                blocks.append(block)
+        return "\n\n".join(blocks), None
+
+    # Cache miss → Fetch mới
+    print(f"[CACHE] MISS cookie: {cookie[:20]}...")
+    details, error = fetch_orders_and_details(cookie)
+    
     if error:
         return None, error
 
     if not details:
         return "📭 <b>Không có đơn hàng</b>", None
 
+    # ✅ Lưu vào cache
+    set_cached_orders(cookie, details)
+
     blocks = []
     for idx, d in enumerate(details, 1):
         if isinstance(d, dict):
-            # Thêm số thứ tự cho mỗi đơn
             block = format_order_simple(d)
             blocks.append(block)
 
-    # Hiển thị tổng số đơn tìm thấy
     return "\n\n".join(blocks), None
 
-
 # =========================================================
-# 🔥 SPX CHECK (tramavandon.com - ĐÚNG API)
+# SPX CHECK
 # =========================================================
 SPX_API = "https://tramavandon.com/api/spx.php"
+
 def check_spx(code: str) -> str:
-    """
-    Call đúng API tramavandon.com như app.py
-    Có thêm:
-    - Tên đơn vị vận chuyển
-    - Dự kiến giao hàng (ước tính)
-    """
-    import requests
-    from datetime import datetime
-
     code = (code or "").strip().upper()
-
-    SPX_API = "https://tramavandon.com/api/spx.php"
 
     payload = {"tracking_id": code}
     headers = {
@@ -1191,7 +1260,6 @@ def check_spx(code: str) -> str:
             status_text = rec.get("buyer_description", "").strip()
             location = rec.get("current_location", {}).get("location_name", "").strip()
 
-            # tìm SĐT shipper
             if not phone:
                 found = re.findall(r"\b0\d{9,10}\b", status_text)
                 if found:
@@ -1203,10 +1271,8 @@ def check_spx(code: str) -> str:
 
             timeline.append(line)
 
-        # ===== DỰ KIẾN GIAO (ƯỚC TÍNH) =====
         eta_text = "-"
         if last_ts:
-            # SPX thường giao sau mốc cuối 1–2 ngày
             eta = datetime.fromtimestamp(last_ts) + timedelta(days=1)
             eta_text = eta.strftime("%d/%m/%Y")
 
@@ -1230,21 +1296,14 @@ def check_spx(code: str) -> str:
         return f"🔎 <b>{esc(code)}</b>\n❌ Lỗi SPX: {e}"
 
 # =========================================================
-# 🔥 SPX GHN 
-# =========================================================    
+# GHN CHECK
+# =========================================================
 def clean_ghn_status(text: str) -> str:
-    """
-    Cắt bỏ nhãn trạng thái chung của GHN, chỉ giữ mô tả chi tiết
-    Ví dụ:
-    'Đang giao hàng – Đơn hàng đang giao đến xxx'
-    -> 'Đơn hàng đang giao đến xxx'
-    """
     if not text:
         return ""
 
     text = text.strip()
 
-    # GHN dùng dấu " – " hoặc " - " để phân tách
     if " – " in text:
         return text.split(" – ", 1)[1].strip()
 
@@ -1252,8 +1311,6 @@ def clean_ghn_status(text: str) -> str:
         return text.split(" - ", 1)[1].strip()
 
     return text
-
-
 
 def check_ghn(order_code: str, max_steps: int = 4) -> str:
     import requests
@@ -1285,7 +1342,6 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
     info = data.get("order_info", {})
     logs = data.get("tracking_logs", [])
 
-    # ===== HEADER =====
     carrier = "GHN | GIAO HÀNG NHANH"
     status_name = info.get("status_name", "-")
     emoji = GHN_STATUS_EMOJI.get(status_name, "🚚")
@@ -1298,7 +1354,6 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
         except Exception:
             eta = leadtime[:10]
 
-    # ===== LỌC LOG (GỌN – GIỮ NGUYÊN DATA GỐC) =====
     timeline = []
     last_key = None
 
@@ -1310,7 +1365,6 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
         if not status:
             continue
 
-        # chống trùng liên tiếp
         key = f"{status}|{addr}"
         if key == last_key:
             continue
@@ -1322,7 +1376,6 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
             except Exception:
                 t = t.replace("T", " ")[:16]
 
-        # GIỮ NGUYÊN CÂU CHỮ GHN
         content = status
         if addr and addr not in status:
             content = f"{status} — {addr}"
@@ -1338,7 +1391,6 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
 
     timeline_text = "\n".join(timeline)
 
-    # ===== OUTPUT =====
     return (
         f"📦 <b>{carrier}</b>\n"
         "━━━━━━━━━━━━━━━\n"
@@ -1349,12 +1401,10 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
         f"{timeline_text}"
     )
 
-
 # =========================================================
 # WEBHOOK HANDLER
 # =========================================================
 def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> None:
-    # ---------- START ----------
     if text == "/start":
         tg_send(
             chat_id,
@@ -1363,9 +1413,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             main_keyboard()
         )
         return
-    # ================== MENU BUTTONS ==================
 
-    # ✅ KÍCH HOẠT (check đã kích ở bot add voucher)
     if text == "✅ Kích Hoạt":
         row_idx, user = get_user_row(tele_id)
 
@@ -1402,6 +1450,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             main_keyboard()
         )
         return
+        
     if text == "📘 Hướng dẫn":
         tg_send(
             chat_id,
@@ -1425,9 +1474,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         )
         return
 
-
-
-    # 💰 SỐ DƯ
     if text == "💰 Số dư":
         row_idx, user = get_user_row(tele_id)
 
@@ -1450,8 +1496,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         )
         return
 
-
-    # 💳 NẠP TIỀN
     if text == "💳 Nạp Tiền":
         tg_send(
             chat_id,
@@ -1462,8 +1506,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         )
         return
 
-
-    # 🎟️ BOT LƯU VOUCHER
     if text == "🎟️ Bot Lưu Voucher":
         tg_send(
             chat_id,
@@ -1473,6 +1515,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             main_keyboard()
         )
         return
+        
     if text == "🧩 Hệ Thống Bot NgânMiu":
         tg_send(
             chat_id,
@@ -1494,14 +1537,12 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             main_keyboard()
         )
         return
-    # ----------GHN
+        
     if is_ghn_code(text):
         result = check_ghn(text)
         tg_send(chat_id, result)
         return
 
-
-    # ---------- USER CHECK ----------
     row_idx, user = get_user_row(tele_id)
     if not user:
         tg_send(
@@ -1512,7 +1553,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         )
         return
 
-    # ---------- BAND CHECK ----------
     is_band, until = check_band(row_idx)
     if is_band:
         tg_send(
@@ -1522,7 +1562,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
         )
         return
 
-    # ---------- PARSE INPUT ----------
     lines = split_lines(text)
     values = [v.strip() for v in lines if is_cookie(v.strip()) or is_spx(v.strip())]
     if not values:
@@ -1537,7 +1576,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
 
     balance = get_balance(user)
 
-    # ---------- PROCESS ----------
     for val in values:
         minute_key = now().strftime("%Y-%m-%d %H:%M")
         tid = safe_text(tele_id)
@@ -1554,7 +1592,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             )
             return
 
-        # FREE LIMIT: chỉ khi balance <= 0
         if balance <= 0:
             used = count_today_request(tele_id)
             if used >= FREE_LIMIT_PER_DAY:
@@ -1565,7 +1602,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
                 )
                 return
 
-        # ================= DO CHECK =================
         if is_cookie(val):
             result, error = check_shopee_orders(val)
 
@@ -1594,19 +1630,15 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str) -> Non
             tg_send(chat_id, result)
             log_check(tele_id, username, val, balance, "check_spx")
 
-
-
-        # chống flood telegram nhẹ
         time.sleep(0.2)
 
 @app.route("/", methods=["POST", "GET"])
 def webhook_root():
     if request.method == "GET":
-        return jsonify({"ok": True, "msg": "Bot is running", "path": "/ or /webhook"}), 200
+        return jsonify({"ok": True, "msg": "Bot STEP 1 Optimized"}), 200
 
     data = request.get_json(silent=True) or {}
 
-    # ---------- CALLBACK ----------
     if "callback_query" in data:
         try:
             handle_callback_query(data)
@@ -1626,7 +1658,6 @@ def webhook_root():
     try:
         _handle_message(chat_id, tele_id, username, text)
     except Exception:
-        # không cho crash server
         err = traceback.format_exc()
         tg_send(chat_id, "❌ Bot gặp lỗi nội bộ, bạn gửi lại sau nhé.")
         try:
@@ -1636,19 +1667,36 @@ def webhook_root():
 
     return "OK"
 
-# FIX 404: Telegram đang bắn /webhook thì route này sẽ nhận
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook_alias():
     return webhook_root()
+
+# =========================================================
+# 🔥 START LOG WORKER THREAD
+# =========================================================
+log_thread = threading.Thread(target=log_worker, daemon=True)
+log_thread.start()
 
 # =========================================================
 # RUN
 # =========================================================
 if __name__ == "__main__":
     print("=" * 50)
-    print("🤖 BOT CHECK SHOPEE + SPX - RUNNING")
+    print("🤖 BOT STEP 1 OPTIMIZED - RUNNING")
     print("=" * 50)
     print(f"📋 Sheet ID: {SHEET_ID[:20]}...")
     print(f"🔑 Bot Token: {BOT_TOKEN[:20]}...")
+    print("✅ Log worker thread started")
     print("=" * 50)
+    
+    # Cleanup cache định kỳ mỗi 5 phút
+    def cleanup_cache_worker():
+        while True:
+            time.sleep(300)  # 5 phút
+            clear_expired_cache()
+            print("[CACHE] Cleaned expired cache")
+    
+    cache_thread = threading.Thread(target=cleanup_cache_worker, daemon=True)
+    cache_thread.start()
+    
     app.run(host="0.0.0.0", port=5000, debug=False)
