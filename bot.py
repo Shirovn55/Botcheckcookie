@@ -95,13 +95,18 @@ else:
 
 # QR API Configuration
 QR_API_BASE = os.getenv("QR_API_BASE", "https://qr-shopee-puce.vercel.app").strip()
-QR_POLL_INTERVAL = 2  # 2 giây check 1 lần
+QR_POLL_INTERVAL = float(os.getenv("QR_POLL_INTERVAL", "1.0"))  # giây check 1 lần (tăng tốc)
 QR_TIMEOUT = 300  # 5 phút timeout
 
 
 # Auto watcher (bot tự theo dõi QR và trả cookie sau khi quét)
 AUTO_QR = os.getenv("AUTO_QR", "true").lower() == "true"
 AUTO_QR_MAX_SECONDS = int(os.getenv("AUTO_QR_MAX_SECONDS", str(QR_TIMEOUT)))
+
+# AUTO detect status mapping (Shopee có thể trả nhiều biến thể)
+SCANNED_STATUSES = {"SCANNED", "CONFIRMED", "AUTHORIZED", "AUTHED", "SUCCESS", "APPROVED", "OK", "DONE"}
+PENDING_STATUSES = {"PENDING", "WAITING", "UNKNOWN", "INIT", "CREATED"}
+
 # QR Session Management
 qr_sessions = {}  # {session_id: {"user_id": user_id, "created": timestamp, "status": "waiting", "qr_image": base64}}
 qr_lock = threading.Lock()
@@ -183,6 +188,19 @@ def safe_int(v: Any, default: int = 0) -> int:
         return int(str(v).replace(",", "").strip())
     except Exception:
         return default
+
+
+def normalize_tele_id(val: Any) -> str:
+    """Chuẩn hoá Tele ID để so sánh (tránh lỗi: khoảng trắng, .0, dạng scientific 1.23E9)."""
+    s = safe_text(val).strip()
+    if not s:
+        return ""
+    # strip common float suffix
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    # if scientific notation like 1.999E9 -> keep digits
+    digits = re.sub(r"\D", "", s)
+    return digits or s
 
 # =========================================================
 # 🔥 QR LOGIN FUNCTIONS
@@ -721,7 +739,7 @@ def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]
     - Cột 4 (E): ghi Chú
     - Cột 5 (F): ghi Chú (trùng tên)
     """
-    tele_id = safe_text(tele_id)
+    tele_id = normalize_tele_id(tele_id)
 
     try:
         # Lấy RAW data từ cache (không dùng get_all_records vì có header trùng)
@@ -739,14 +757,14 @@ def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]
                 continue
 
             # Đọc theo INDEX
-            row_tele_id = safe_text(row[0]) if len(row) > 0 else ""  # Cột A
+            row_tele_id = normalize_tele_id(row[0]) if len(row) > 0 else ""  # Cột A
             row_username = safe_text(row[1]) if len(row) > 1 else ""  # Cột B
             row_balance = safe_text(row[2]) if len(row) > 2 else "0"  # Cột C
             row_status = safe_text(row[3]) if len(row) > 3 else ""    # Cột D
             row_note = safe_text(row[4]) if len(row) > 4 else ""      # Cột E
 
             # So sánh Tele ID
-            if row_tele_id == tele_id:
+            if row_tele_id and tele_id and row_tele_id == tele_id:
                 # Return normalized data
                 user_data = {
                     "Tele ID": row_tele_id,
@@ -878,7 +896,7 @@ def log_qr(tele_id: Any, username: str, session_id: str, status: str, balance_af
     })
 
 def count_today_request(tele_id: Any) -> int:
-    tele_id = safe_text(tele_id)
+    tele_id = normalize_tele_id(tele_id)
     today = now().strftime("%Y-%m-%d")
 
     try:
@@ -1977,12 +1995,32 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
             qr_sessions[session_id]["username"] = username
             qr_sessions[session_id]["cancelled"] = False
 
-    # ✅ AUTO: Bot tự theo dõi QR và trả cookie sau khi quét
+    # ✅ AUTO (FAST): chờ nhanh trong CHÍNH request này (giúp serverless trả cookie nhanh nếu bạn quét liền)
     if AUTO_QR:
         try:
+            tg_send(
+                chat_id,
+                f"🤖 <b>Auto đang bật</b> — bot đang chờ bạn quét trong <b>{AUTO_QR_FAST_SECONDS}s</b>...\\n\\n"
+                f"<i>Nếu bạn quét muộn hơn, vẫn có thể bấm 🔄 Check QR Status.</i>"
+            )
+
+            started_fast = time.time()
+            while time.time() - started_fast < AUTO_QR_FAST_SECONDS:
+                ok, status, has_token = check_qr_status(session_id)
+                st = (status or "").strip().upper()
+
+                if ok and (has_token or st in SCANNED_STATUSES or (st and st not in PENDING_STATUSES)):
+                    ok2, cookie2 = get_qr_cookie(session_id)
+                    if ok2 and cookie2:
+                        _send_cookie_success(chat_id, tele_id, username, session_id, cookie2)
+                        return
+
+                time.sleep(QR_POLL_INTERVAL)
+
+            # ✅ AUTO (BG): fallback thread (chỉ ổn định khi bot chạy server luôn-on)
             t = threading.Thread(target=_auto_watch_qr_and_send_cookie, args=(session_id,), daemon=True)
             t.start()
-            tg_send(chat_id, "🤖 <b>Auto đang bật</b> — Bot sẽ tự nhận diện sau khi bạn quét và trả cookie luôn.\n\n<i>Nếu lâu quá, bạn vẫn có thể bấm 🔄 Check QR Status.</i>")
+
         except Exception:
             pass
 
@@ -2030,7 +2068,7 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
 
             # Nếu API status lỗi, thử login thưa thớt (phòng trường hợp status endpoint đang lỗi)
             if not ok and status in ("API_ERROR", "CHECK_ERROR"):
-                if time.time() - last_login_try > 6:
+                if time.time() - last_login_try > 2:
                     last_login_try = time.time()
                     ok2, cookie2 = get_qr_cookie(session_id)
                     if ok2 and cookie2:
@@ -2046,7 +2084,10 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
                     qr_sessions.pop(session_id, None)
                 return
 
-            if ok and (status == "SCANNED" or has_token):
+            # Shopee status có thể là 'SCANNED' / 'CONFIRMED' / 'AUTHORIZED' / ... hoặc has_token=True
+            st = (status or "").strip().upper()
+            if ok and (has_token or st in SCANNED_STATUSES or (st and st not in PENDING_STATUSES)):
+
                 ok2, cookie = get_qr_cookie(session_id)
                 if ok2 and cookie:
                     _send_cookie_success(chat_id, tele_id, username, session_id, cookie)
