@@ -3,12 +3,6 @@
 NgânMiu.Store — BOT CHECK ĐƠN HÀNG SHOPEE + TRA MÃ VẬN ĐƠN SPX + GET COOKIE QR
 ✅ STEP 1 OPTIMIZATION: Cache Cookie + Batch Log + Timeout tối ưu
 ✅ TÍCH HỢP GET COOKIE QR SHOPEE
-
-🔧 FIXED (Jan 2026):
-- Fix logic get_qr_cookie(): nếu session đã có cookie thì trả ngay (không gọi API lại)
-- Fix logic check_shopee_orders_with_payment(): tách rõ error và result để không hiểu nhầm
-- Add basic locks cho qr_sessions / order_cache / spam_cache (giảm race condition trong 1 instance)
-- Prune spam_cache theo phút (giảm phình RAM)
 """
 
 import os
@@ -19,6 +13,7 @@ import html
 import traceback
 import threading
 import base64
+from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
@@ -69,7 +64,6 @@ TIMEOUT_RETRY = 1   # Số lần retry khi timeout
 # ✅ FIX 2: CACHE COOKIE (mới)
 CACHE_COOKIE_TTL = int(os.getenv("CACHE_COOKIE_TTL", "45"))  # 45 giây
 order_cache = {}  # {cookie: {"data": [...], "time": timestamp}}
-cache_lock = threading.Lock()
 
 # ✅ FIX 3: BATCH LOG (mới)
 LOG_BATCH_SIZE = int(os.getenv("LOG_BATCH_SIZE", "10"))     # Gom 10 dòng
@@ -100,7 +94,6 @@ QR_TIMEOUT = 300  # 5 phút timeout
 
 # QR Session Management
 qr_sessions = {}  # {session_id: {"user_id": user_id, "created": timestamp, "status": "waiting", "qr_image": base64}}
-qr_lock = threading.Lock()
 
 # User cache (giữ nguyên từ version trước)
 CACHE_USERS_SECONDS = int(os.getenv("CACHE_USERS_SECONDS", "60"))
@@ -160,7 +153,6 @@ app = Flask(__name__)
 # RUNTIME CACHE
 # =========================================================
 spam_cache: Dict[str, Dict[str, int]] = {}
-spam_lock = threading.Lock()
 
 # =========================================================
 # COMMON UTILS
@@ -191,118 +183,110 @@ def create_qr_session(user_id: int) -> Tuple[bool, str, str]:
             json={"user_id": user_id},
             timeout=10
         )
-
+        
         if response.status_code != 200:
             return False, f"API error: {response.status_code}", ""
-
+        
         data = response.json()
-
+        
         if not data.get("success"):
             error_msg = data.get("error", "Unknown error")
             return False, f"Create QR failed: {error_msg}", ""
-
+        
         session_id = data.get("session_id")
         qr_image = data.get("qr_image", "").replace("data:image/png;base64,", "")
-
-        # Lưu session (lock)
-        with qr_lock:
-            qr_sessions[session_id] = {
-                "user_id": user_id,
-                "created": time.time(),
-                "status": "waiting",  # waiting, scanned, done, expired
-                "qr_image": qr_image,
-                "cookie": ""
-            }
-
+        
+        # Lưu session
+        qr_sessions[session_id] = {
+            "user_id": user_id,
+            "created": time.time(),
+            "status": "waiting",  # waiting, scanned, done, expired
+            "qr_image": qr_image,
+            "cookie": ""
+        }
+        
         return True, session_id, qr_image
-
+        
     except Exception as e:
         return False, f"Error: {str(e)}", ""
 
 def check_qr_status(session_id: str) -> Tuple[bool, str, bool]:
     """Kiểm tra trạng thái QR"""
-    with qr_lock:
-        if session_id not in qr_sessions:
-            return False, "NOT_FOUND", False
-        session = qr_sessions[session_id]
-
+    if session_id not in qr_sessions:
+        return False, "NOT_FOUND", False
+    
+    session = qr_sessions[session_id]
+    
     # Check timeout
     if time.time() - session["created"] > QR_TIMEOUT:
-        with qr_lock:
-            if session_id in qr_sessions:
-                qr_sessions[session_id]["status"] = "expired"
+        session["status"] = "expired"
         return False, "EXPIRED", False
-
+    
     try:
         response = requests.get(
             f"{QR_API_BASE}/api/qr/status/{session_id}",
             timeout=5
         )
-
+        
         if response.status_code != 200:
             return False, "API_ERROR", False
-
+        
         data = response.json()
-
+        
         if not data.get("success"):
             return False, data.get("status", "UNKNOWN"), False
-
+        
         status = data.get("status", "")
         has_token = data.get("has_token", False)
-
+        
         if status == "SCANNED" or has_token:
-            with qr_lock:
-                if session_id in qr_sessions:
-                    qr_sessions[session_id]["status"] = "scanned"
+            session["status"] = "scanned"
             return True, "SCANNED", has_token
         elif status == "NOT_FOUND":
-            with qr_lock:
-                if session_id in qr_sessions:
-                    qr_sessions[session_id]["status"] = "expired"
+            session["status"] = "expired"
             return False, "EXPIRED", False
         else:
             return True, status, has_token
-
+            
     except Exception:
         return False, "CHECK_ERROR", False
 
 def get_qr_cookie(session_id: str) -> Tuple[bool, str]:
     """Lấy cookie sau khi quét QR thành công"""
-    with qr_lock:
-        if session_id not in qr_sessions:
-            return False, "Session not found"
-        session = qr_sessions[session_id]
-        # ✅ FIX: Nếu đã có cookie thì trả luôn (không gọi API lại)
-        if session.get("cookie"):
-            return True, session["cookie"]
-
+    if session_id not in qr_sessions:
+        return False, "Session not found"
+    
+    session = qr_sessions[session_id]
+    
+    if session["status"] != "scanned" and session.get("cookie"):
+        # Đã có cookie rồi
+        return True, session["cookie"]
+    
     try:
         response = requests.post(
             f"{QR_API_BASE}/api/qr/login/{session_id}",
             timeout=10
         )
-
+        
         if response.status_code != 200:
             return False, f"API error: {response.status_code}"
-
+        
         data = response.json()
-
+        
         if not data.get("success"):
             error_msg = data.get("error", "Login failed")
             return False, error_msg
-
+        
         cookie = data.get("cookie", "")
         if not cookie:
             return False, "No cookie returned"
-
-        # Lưu cookie vào session (lock)
-        with qr_lock:
-            if session_id in qr_sessions:
-                qr_sessions[session_id]["cookie"] = cookie
-                qr_sessions[session_id]["status"] = "done"
-
+        
+        # Lưu cookie vào session
+        session["cookie"] = cookie
+        session["status"] = "done"
+        
         return True, cookie
-
+        
     except Exception as e:
         return False, f"Error: {str(e)}"
 
@@ -310,15 +294,14 @@ def cleanup_qr_sessions():
     """Dọn session QR cũ"""
     current_time = time.time()
     expired_sessions = []
-
-    with qr_lock:
-        for session_id, session in list(qr_sessions.items()):
-            if current_time - session["created"] > QR_TIMEOUT:
-                expired_sessions.append(session_id)
-
-        for session_id in expired_sessions:
-            qr_sessions.pop(session_id, None)
-
+    
+    for session_id, session in qr_sessions.items():
+        if current_time - session["created"] > QR_TIMEOUT:
+            expired_sessions.append(session_id)
+    
+    for session_id in expired_sessions:
+        del qr_sessions[session_id]
+    
     return len(expired_sessions)
 
 # =========================================================
@@ -326,37 +309,34 @@ def cleanup_qr_sessions():
 # =========================================================
 def get_cached_orders(cookie: str):
     """Lấy kết quả đã cache theo cookie"""
-    with cache_lock:
-        item = order_cache.get(cookie)
-        if not item:
-            return None
-
-        # Kiểm tra TTL
-        if time.time() - item["time"] > CACHE_COOKIE_TTL:
-            # Cache hết hạn
-            order_cache.pop(cookie, None)
-            return None
-
-        return item["data"]
+    item = order_cache.get(cookie)
+    if not item:
+        return None
+    
+    # Kiểm tra TTL
+    if time.time() - item["time"] > CACHE_COOKIE_TTL:
+        # Cache hết hạn
+        del order_cache[cookie]
+        return None
+    
+    return item["data"]
 
 def set_cached_orders(cookie: str, data):
     """Lưu kết quả vào cache"""
-    with cache_lock:
-        order_cache[cookie] = {
-            "data": data,
-            "time": time.time()
-        }
+    order_cache[cookie] = {
+        "data": data,
+        "time": time.time()
+    }
 
 def clear_expired_cache():
     """Dọn cache cũ (chạy định kỳ)"""
     current_time = time.time()
-    with cache_lock:
-        expired = [
-            k for k, v in list(order_cache.items())
-            if current_time - v["time"] > CACHE_COOKIE_TTL
-        ]
-        for k in expired:
-            order_cache.pop(k, None)
+    expired = [
+        k for k, v in order_cache.items()
+        if current_time - v["time"] > CACHE_COOKIE_TTL
+    ]
+    for k in expired:
+        del order_cache[k]
 
 # =========================================================
 # 🔥 FIX 3: BATCH LOG WORKER
@@ -372,28 +352,28 @@ def log_worker():
     buffer_spam = []
     buffer_qr = []
     last_flush = time.time()
-
+    
     print("[LOG] Batch log worker started")
-
+    
     while True:
         try:
             # Lấy item từ queue (timeout 0.5s)
             item = log_queue.get(timeout=0.5)
-
+            
             log_type = item.get("type")
             data = item.get("data")
-
+            
             if log_type == "check":
                 buffer_check.append(data)
             elif log_type == "spam":
                 buffer_spam.append(data)
             elif log_type == "qr":
                 buffer_qr.append(data)
-
-        except Exception:
+                
+        except:
             # Timeout → Không có item mới
             pass
-
+        
         # Kiểm tra điều kiện flush
         current_time = time.time()
         should_flush = (
@@ -402,7 +382,7 @@ def log_worker():
             len(buffer_qr) >= LOG_BATCH_SIZE or
             (current_time - last_flush) >= LOG_BATCH_INTERVAL
         )
-
+        
         if should_flush:
             # Flush buffer_check
             if buffer_check:
@@ -415,7 +395,7 @@ def log_worker():
                 except Exception as e:
                     print(f"[LOG] Error flushing check: {e}")
                 buffer_check.clear()
-
+            
             # Flush buffer_spam
             if buffer_spam:
                 try:
@@ -427,7 +407,7 @@ def log_worker():
                 except Exception as e:
                     print(f"[LOG] Error flushing spam: {e}")
                 buffer_spam.clear()
-
+            
             # Flush buffer_qr
             if buffer_qr:
                 try:
@@ -439,7 +419,7 @@ def log_worker():
                 except Exception as e:
                     print(f"[LOG] Error flushing QR: {e}")
                 buffer_qr.clear()
-
+            
             last_flush = current_time
 
 # =========================================================
@@ -449,7 +429,7 @@ def check_balance_bot1(user_id: int) -> tuple:
     """Check user balance from Bot 1"""
     if not BOT1_API_URL:
         return True, 999999, ""
-
+    
     try:
         response = requests.post(
             f"{BOT1_API_URL}/api/check_balance",
@@ -457,7 +437,7 @@ def check_balance_bot1(user_id: int) -> tuple:
             timeout=10
         )
         data = response.json()
-
+        
         if response.status_code == 200 and data.get("success"):
             return True, data.get("balance", 0), ""
         else:
@@ -469,7 +449,7 @@ def deduct_balance_bot1(user_id: int, amount: int, reason: str, username: str = 
     """Deduct money from Bot 1"""
     if not BOT1_API_URL:
         return True, 999999, ""
-
+    
     try:
         response = requests.post(
             f"{BOT1_API_URL}/api/deduct",
@@ -482,7 +462,7 @@ def deduct_balance_bot1(user_id: int, amount: int, reason: str, username: str = 
             timeout=10
         )
         data = response.json()
-
+        
         if response.status_code == 200 and data.get("success"):
             return True, data.get("new_balance", 0), ""
         else:
@@ -505,37 +485,34 @@ def check_shopee_orders_with_payment(cookie: str, user_id: int, username: str = 
     """Check Shopee orders with auto payment"""
     if BOT1_API_URL:
         success, balance, error = check_balance_bot1(user_id)
-
+        
         if not success:
             return False, f"⚠️ Lỗi hệ thống: {error}", 0
-
+        
         if balance < PRICE_CHECK_COOKIE:
             msg = format_insufficient_balance_msg(balance, PRICE_CHECK_COOKIE)
             return False, msg, balance
     else:
         balance = 0
-
-    # ✅ FIX: tách rõ result và error
-    result_html, err = check_shopee_orders(cookie)
-
-    if err:
-        if err == "cookie_expired":
-            return False, "❌ Cookie hết hạn hoặc không hợp lệ", balance
-        if err == "no_orders":
-            return False, "📭 Không có đơn hàng nào", balance
-        return False, f"❌ Check cookie thất bại ({err})", balance
-
-    if not result_html:
-        return False, "❌ Check cookie thất bại", balance
-
+    
+    result_html, result_text = check_shopee_orders(cookie)
+    
+    if not result_html or result_text:
+        error_msg = "❌ Check cookie thất bại"
+        if result_text == "cookie_expired":
+            error_msg = "❌ Cookie hết hạn hoặc không hợp lệ"
+        elif result_text == "no_orders":
+            error_msg = "📭 Không có đơn hàng nào"
+        return False, error_msg, balance
+    
     if BOT1_API_URL:
         success, new_balance, error = deduct_balance_bot1(
             user_id, PRICE_CHECK_COOKIE, "Check cookie Shopee", username
         )
-
+        
         if not success:
             return True, f"{result_html}\n\n⚠️ Không trừ được tiền: {error}", balance
-
+        
         final = (
             f"{result_html}\n\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -556,11 +533,11 @@ def check_spx_with_payment(code: str, user_id: int, username: str = "") -> tuple
             return False, format_insufficient_balance_msg(balance, PRICE_CHECK_SPX), balance
     else:
         balance = 0
-
+    
     result = check_spx(code)
     if "❌" in result or "Lỗi" in result:
         return False, result, balance
-
+    
     if BOT1_API_URL:
         success, new_balance, error = deduct_balance_bot1(
             user_id, PRICE_CHECK_SPX, f"Check SPX: {code}", username
@@ -582,11 +559,11 @@ def check_ghn_with_payment(order_code: str, user_id: int, username: str = "") ->
             return False, format_insufficient_balance_msg(balance, PRICE_CHECK_GHN), balance
     else:
         balance = 0
-
+    
     result = check_ghn(order_code)
     if "❌" in result or "Lỗi" in result:
         return False, result, balance
-
+    
     if BOT1_API_URL:
         success, new_balance, error = deduct_balance_bot1(
             user_id, PRICE_CHECK_GHN, f"Check GHN: {order_code}", username
@@ -708,7 +685,7 @@ def get_all_users_cached():
 def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
     """
     ✅ FIXED: Đọc theo INDEX cột thay vì tên (tránh lỗi header trùng)
-
+    
     Sheet structure (by INDEX):
     - Cột 0 (A): Tele ID
     - Cột 1 (B): username
@@ -718,29 +695,29 @@ def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]
     - Cột 5 (F): ghi Chú (trùng tên)
     """
     tele_id = safe_text(tele_id)
-
+    
     try:
         # Lấy RAW data từ cache (không dùng get_all_records vì có header trùng)
         try:
             values = ws_user.get_all_values()
         except Exception:
             return None, None
-
+        
         if not values or len(values) < 2:
             return None, None
-
+        
         # Duyệt từng row (bỏ qua header)
         for idx, row in enumerate(values[1:], start=2):
             if not row or len(row) < 4:  # Cần ít nhất 4 cột
                 continue
-
+            
             # Đọc theo INDEX
             row_tele_id = safe_text(row[0]) if len(row) > 0 else ""  # Cột A
             row_username = safe_text(row[1]) if len(row) > 1 else ""  # Cột B
             row_balance = safe_text(row[2]) if len(row) > 2 else "0"  # Cột C
             row_status = safe_text(row[3]) if len(row) > 3 else ""    # Cột D
             row_note = safe_text(row[4]) if len(row) > 4 else ""      # Cột E
-
+            
             # So sánh Tele ID
             if row_tele_id == tele_id:
                 # Return normalized data
@@ -751,13 +728,14 @@ def get_user_row(tele_id: Any) -> Tuple[Optional[int], Optional[Dict[str, Any]]]
                     "trang thai": row_status.lower().strip(),  # Normalize status
                     "ghi chu": row_note
                 }
-
+                
                 return idx, user_data
-
+        
     except Exception as e:
         print(f"[ERROR] get_user_row exception: {e}")
+        import traceback
         traceback.print_exc()
-
+    
     return None, None
 
 def get_balance(user: Dict[str, Any]) -> int:
@@ -921,16 +899,16 @@ def tg_send_photo(chat_id: Any, photo_base64: str, caption: str = "") -> None:
     try:
         # Decode base64
         photo_bytes = base64.b64decode(photo_base64)
-
+        
         # Tạo file object
         files = {'photo': ('qr.png', photo_bytes, 'image/png')}
-
+        
         payload = {
             "chat_id": chat_id,
             "caption": caption,
             "parse_mode": "HTML"
         }
-
+        
         requests.post(f"{BASE_URL}/sendPhoto", data=payload, files=files, timeout=15)
     except Exception as e:
         print(f"[ERROR] Send photo failed: {e}")
@@ -951,7 +929,7 @@ def main_keyboard():
     return {
         "keyboard": [
             ["✅ Kích Hoạt", "💰 Số dư"],
-            ["🔑 Get Cookie QR", "📘 Hướng dẫn"],
+            ["🔑 Get Cookie QR", "📘 Hướng dẫn"],  # Thêm nút Get Cookie QR
             ["💳 Nạp Tiền", "🧩 Hệ Thống Bot NgânMiu"]
         ],
         "resize_keyboard": True
@@ -1145,7 +1123,7 @@ def fmt_ts(ts):
 def fetch_single_order_detail(order_id: str, headers: dict) -> Optional[dict]:
     """Fetch chi tiết 1 order với retry"""
     url = f"{SHOPEE_BASE}/order/get_order_detail"
-
+    
     for attempt in range(TIMEOUT_RETRY + 1):
         try:
             r = requests.get(
@@ -1162,7 +1140,7 @@ def fetch_single_order_detail(order_id: str, headers: dict) -> Optional[dict]:
             return None
         except Exception:
             return None
-
+    
     return None
 
 # =========================================================
@@ -1172,7 +1150,7 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
     """PARALLEL VERSION với timeout mới"""
     headers = build_headers(cookie)
     list_url = f"{SHOPEE_BASE}/order/get_all_order_and_checkout_list"
-
+    
     # Step 1: Lấy list orders
     for attempt in range(TIMEOUT_RETRY + 1):
         try:
@@ -1182,12 +1160,12 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
                 params={
                     "limit": limit,
                     "offset": 0,
-                    "need_order_response": 1,
+                    "need_order_response": 1,  # ✅ FIX 4: Giảm payload
                     "need_shipping_info": 0
                 },
                 timeout=TIMEOUT_LIST  # 5s
             )
-
+            
             if r.status_code == 200:
                 data = r.json()
                 break
@@ -1199,7 +1177,7 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
             return None, f"error: {e}"
     else:
         return None, "timeout"
-
+    
     # Cookie validation
     if isinstance(data, dict):
         if (
@@ -1208,31 +1186,31 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
             or data.get("msg") in ("unauthorized", "forbidden")
         ):
             return None, "cookie_expired"
-
+    
     # Parse order IDs
     order_ids = bfs_values_by_key(data, ("order_id",)) if isinstance(data, dict) else []
-
+    
     if not order_ids:
-        if not data or (isinstance(data, dict) and len(data.keys()) <= 2):
+        if not data or len(data.keys()) <= 2:
             return None, "cookie_expired"
         return None, "no_orders"
-
+    
     # Remove duplicates
     seen, uniq = set(), []
     for oid in order_ids:
         if oid not in seen:
             seen.add(oid)
             uniq.append(oid)
-
+    
     # Step 2: Parallel fetch details
     details = []
-
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_oid = {
-            executor.submit(fetch_single_order_detail, oid, headers): oid
+            executor.submit(fetch_single_order_detail, oid, headers): oid 
             for oid in uniq[:limit]
         }
-
+        
         for future in as_completed(future_to_oid, timeout=TIMEOUT_DETAIL + 2):
             try:
                 result = future.result(timeout=1)
@@ -1240,24 +1218,24 @@ def fetch_orders_and_details_parallel(cookie: str, limit: int = 5):
                     details.append(result)
             except Exception:
                 pass
-
+    
     if not details:
         return None, "cookie_expired"
-
+    
     return details, None
 
 def fetch_orders_and_details(cookie: str, limit: int = None):
     """Smart dispatcher"""
     if limit is None:
         limit = CHECK_LIMIT
-
+    
     if USE_PARALLEL:
         return fetch_orders_and_details_parallel(cookie, limit)
-
+    
     # Sequential mode
     headers = build_headers(cookie)
     list_url = f"{SHOPEE_BASE}/order/get_all_order_and_checkout_list"
-
+    
     try:
         r = requests.get(
             list_url,
@@ -1265,19 +1243,19 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
             params={
                 "limit": limit,
                 "offset": 0,
-                "need_order_response": 1,
+                "need_order_response": 1,  # ✅ Giảm payload
                 "need_shipping_info": 0
             },
             timeout=TIMEOUT_LIST
         )
-
+        
         if r.status_code != 200:
             return None, f"http_{r.status_code}"
-
+        
         data = r.json()
     except Exception as e:
         return None, f"timeout: {e}"
-
+    
     if isinstance(data, dict):
         if (
             data.get("error") in (401, 403)
@@ -1285,29 +1263,29 @@ def fetch_orders_and_details(cookie: str, limit: int = None):
             or data.get("msg") in ("unauthorized", "forbidden")
         ):
             return None, "cookie_expired"
-
+    
     order_ids = bfs_values_by_key(data, ("order_id",)) if isinstance(data, dict) else []
-
+    
     if not order_ids:
-        if not data or (isinstance(data, dict) and len(data.keys()) <= 2):
+        if not data or len(data.keys()) <= 2:
             return None, "cookie_expired"
         return None, "no_orders"
-
+    
     seen, uniq = set(), []
     for oid in order_ids:
         if oid not in seen:
             seen.add(oid)
             uniq.append(oid)
-
+    
     details = []
     for oid in uniq[:limit]:
         detail = fetch_single_order_detail(oid, headers)
         if detail:
             details.append(detail)
-
+    
     if not details:
         return None, "cookie_expired"
-
+    
     return details, None
 
 def format_order_simple(detail: dict) -> str:
@@ -1445,16 +1423,18 @@ def check_shopee_orders(cookie: str) -> Tuple[Optional[str], Optional[str]]:
     cached = get_cached_orders(cookie)
     if cached:
         print(f"[CACHE] HIT cookie: {cookie[:20]}...")
+        # Format từ cache
         blocks = []
         for d in cached:
             if isinstance(d, dict):
-                blocks.append(format_order_simple(d))
+                block = format_order_simple(d)
+                blocks.append(block)
         return "\n\n".join(blocks), None
 
     # Cache miss → Fetch mới
     print(f"[CACHE] MISS cookie: {cookie[:20]}...")
     details, error = fetch_orders_and_details(cookie)
-
+    
     if error:
         return None, error
 
@@ -1465,9 +1445,10 @@ def check_shopee_orders(cookie: str) -> Tuple[Optional[str], Optional[str]]:
     set_cached_orders(cookie, details)
 
     blocks = []
-    for d in details:
+    for idx, d in enumerate(details, 1):
         if isinstance(d, dict):
-            blocks.append(format_order_simple(d))
+            block = format_order_simple(d)
+            blocks.append(block)
 
     return "\n\n".join(blocks), None
 
@@ -1504,13 +1485,17 @@ def check_spx(code: str) -> str:
         timeline = []
         phone = ""
         last_ts = None
+        first_ts = None
 
         for rec in records:
             ts = rec.get("actual_time")
             if not ts:
                 continue
 
+            if not first_ts:
+                first_ts = ts
             last_ts = ts
+
             dt = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
 
             status_text = rec.get("buyer_description", "").strip()
@@ -1569,6 +1554,9 @@ def clean_ghn_status(text: str) -> str:
     return text
 
 def check_ghn(order_code: str, max_steps: int = 4) -> str:
+    import requests
+    from datetime import datetime
+
     url = "https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs"
 
     headers = {
@@ -1612,6 +1600,7 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
 
     for lg in reversed(logs):
         status = clean_ghn_status(lg.get("status_name", "").strip())
+
         addr = lg.get("location", {}).get("address", "").strip()
 
         if not status:
@@ -1656,8 +1645,11 @@ def check_ghn(order_code: str, max_steps: int = 4) -> str:
 # =========================================================
 # 📢 THÔNG BÁO SYSTEM (ADMIN ONLY) - 3 LỚP BẢO VỆ
 # =========================================================
+
+# Admin IDs (Tele ID của admin)
 ADMIN_IDS = [
-    1359771167,  # BonBonxHPx
+    1359771167,  # BonBonxHPx (từ ảnh sheet)
+    # Thêm admin khác ở đây
 ]
 
 # =========================================================
@@ -1670,7 +1662,7 @@ def get_broadcast_sheet():
     try:
         try:
             return sh.worksheet("BroadcastState")
-        except Exception:
+        except:
             ws = sh.add_worksheet("BroadcastState", 100, 4)
             ws.update('A1:D1', [['Timestamp', 'AdminID', 'Status', 'MessageID']])
             return ws
@@ -1685,15 +1677,17 @@ def get_last_broadcast_time_from_sheet():
         return None
     try:
         all_values = ws.get_all_values()
-        if len(all_values) <= 1:
+        if len(all_values) <= 1:  # Chỉ có header
             return None
-
-        for row in reversed(all_values[1:]):
-            if len(row) >= 3 and row[2] in ["STARTED", "COMPLETED"]:
+        
+        # Tìm broadcast STARTED/COMPLETED gần nhất
+        for row in reversed(all_values[1:]):  # Skip header, đọc ngược
+            if row[2] in ["STARTED", "COMPLETED"]:
                 timestamp_str = row[0]
+                # Parse: "2025-12-31 16:46:00"
                 dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
                 return dt.timestamp()
-
+        
         return None
     except Exception as e:
         print(f"[ERROR] get_last_broadcast_time_from_sheet: {e}")
@@ -1718,7 +1712,10 @@ def set_broadcast_state_to_sheet(admin_id, status, message_id=""):
         return False
 
 def is_broadcast_message_processed(message_id):
-    """LỚP 1: Check message_id đã từng broadcast chưa"""
+    """
+    ✅ LỚP 1: Check message_id đã từng broadcast chưa
+    Đây là lớp bảo vệ MẠNH NHẤT - chặn forward message cũ
+    """
     if not message_id:
         return False
 
@@ -1727,6 +1724,7 @@ def is_broadcast_message_processed(message_id):
         return False
 
     try:
+        # Cột D = MessageID
         col_message_ids = ws.col_values(4)
         return str(message_id) in col_message_ids
     except Exception as e:
@@ -1734,31 +1732,46 @@ def is_broadcast_message_processed(message_id):
         return False
 
 def check_broadcast_cooldown_from_sheet():
-    """LỚP 2: Check cooldown từ sheet (serverless-safe)"""
+    """
+    ✅ LỚP 2: Check cooldown từ sheet (serverless-safe)
+    Chặn gửi quá nhanh
+    """
     last_time = get_last_broadcast_time_from_sheet()
     if not last_time:
-        return True, 0
-
+        return True, 0  # OK to broadcast
+    
     current_time = time.time()
     time_since_last = current_time - last_time
-
-    BROADCAST_COOLDOWN = 60
+    
+    BROADCAST_COOLDOWN = 60  # 60 giây
+    
     print(f"[BROADCAST] Time since last: {time_since_last:.1f}s")
-
+    
     if time_since_last < BROADCAST_COOLDOWN:
         wait_time = int(BROADCAST_COOLDOWN - time_since_last)
         return False, wait_time
-
+    
     return True, 0
 
 def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, message_id: int) -> None:
-    """3 lớp bảo vệ broadcast"""
+    """
+    ✅ 3 LỚP BẢO VỆ CHỐNG GỬI LẶP:
+    1. Check message_id (chặn forward)
+    2. Cooldown 60s (chặn spam)
+    3. Broadcast lock (chặn song song)
+    """
     global IS_BROADCASTING
-
+    
+    # 1. Kiểm tra quyền admin
     if tele_id not in ADMIN_IDS:
-        tg_send(chat_id, "❌ <b>KHÔNG CÓ QUYỀN</b>\n\nChỉ admin mới được sử dụng lệnh này.")
+        tg_send(
+            chat_id,
+            "❌ <b>KHÔNG CÓ QUYỀN</b>\n\n"
+            "Chỉ admin mới được sử dụng lệnh này."
+        )
         return
-
+    
+    # 2. Parse nội dung
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         tg_send(
@@ -1773,9 +1786,10 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
             "• Chống spam: 3 lớp bảo vệ tự động"
         )
         return
-
+    
     message_content = parts[1].strip()
-
+    
+    # ✅ LỚP 1: CHECK MESSAGE_ID (MẠNH NHẤT!)
     if is_broadcast_message_processed(message_id):
         tg_send(
             chat_id,
@@ -1785,7 +1799,8 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
         )
         print(f"[BROADCAST] ❌ BLOCKED - Duplicate message_id: {message_id}")
         return
-
+    
+    # ✅ LỚP 2: CHECK COOLDOWN
     can_broadcast, wait_time = check_broadcast_cooldown_from_sheet()
     if not can_broadcast:
         tg_send(
@@ -1796,34 +1811,42 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
         )
         print(f"[BROADCAST] ❌ BLOCKED - Cooldown: {wait_time}s")
         return
-
+    
+    # ✅ LỚP 3: BROADCAST LOCK (chặn chạy song song)
     if IS_BROADCASTING:
-        tg_send(chat_id, "⛔ <b>ĐANG CÓ BROADCAST KHÁC CHẠY</b>\n\nVui lòng đợi broadcast trước hoàn tất.")
+        tg_send(
+            chat_id,
+            "⛔ <b>ĐANG CÓ BROADCAST KHÁC CHẠY</b>\n\n"
+            "Vui lòng đợi broadcast trước hoàn tất."
+        )
         print(f"[BROADCAST] ❌ BLOCKED - Already broadcasting")
         return
-
+    
     IS_BROADCASTING = True
-
+    
     try:
+        # 4. Lấy danh sách users
         try:
             values = ws_user.get_all_values()
         except Exception:
             IS_BROADCASTING = False
             tg_send(chat_id, "❌ Không thể đọc danh sách users từ Sheet")
             return
-
+        
         if not values or len(values) < 2:
             IS_BROADCASTING = False
             tg_send(chat_id, "❌ Không tìm thấy user nào trong Sheet")
             return
-
-        total_users = len(values) - 1
-
+        
+        total_users = len(values) - 1  # Trừ header
+        
+        # 5. Lưu state STARTED
         if not set_broadcast_state_to_sheet(tele_id, "STARTED", message_id):
             IS_BROADCASTING = False
             tg_send(chat_id, "❌ Lỗi khi lưu trạng thái broadcast")
             return
-
+        
+        # 6. Preview message
         tg_send(
             chat_id,
             f"📢 <b>ĐANG GỬI THÔNG BÁO...</b>\n\n"
@@ -1833,23 +1856,27 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
             f"{message_content}\n"
             f"━━━━━━━━━━━━━━━"
         )
-
+        
+        # 7. Gửi broadcast
         success_count = 0
         fail_count = 0
-        sent_to = set()
-
-        for row in values[1:]:
+        sent_to = set()  # Track để tránh duplicate
+        
+        for idx, row in enumerate(values[1:], start=2):
             if not row or len(row) < 1:
                 continue
-
-            user_tele_id = safe_text(row[0])
+            
+            user_tele_id = safe_text(row[0])  # Cột A: Tele ID
             if not user_tele_id or not user_tele_id.isdigit():
                 continue
-
+            
+            # Skip duplicate
             if user_tele_id in sent_to:
+                print(f"[BROADCAST] Skip duplicate: {user_tele_id}")
                 continue
-
+            
             try:
+                # Format message
                 full_message = (
                     f"📢 <b>THÔNG BÁO TỪ ADMIN</b>\n"
                     f"━━━━━━━━━━━━━━━\n\n"
@@ -1857,18 +1884,22 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
                     f"━━━━━━━━━━━━━━━\n"
                     f"<i>Từ: NgânMiu.Store Bot System</i>"
                 )
-
+                
                 tg_send(user_tele_id, full_message)
                 sent_to.add(user_tele_id)
                 success_count += 1
+                
+                # Delay nhẹ
                 time.sleep(0.05)
-
+                
             except Exception as e:
                 fail_count += 1
                 print(f"[BROADCAST] Failed to send to {user_tele_id}: {e}")
-
+        
+        # 8. Lưu state COMPLETED
         set_broadcast_state_to_sheet(tele_id, "COMPLETED", message_id)
-
+        
+        # 9. Report kết quả
         tg_send(
             chat_id,
             f"✅ <b>GỬI THÔNG BÁO HOÀN TẤT</b>\n\n"
@@ -1877,13 +1908,21 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
             f"• Thất bại: {fail_count} users\n"
             f"• Tổng cộng: {total_users} users"
         )
-
+        
+        print(f"[BROADCAST] ✅ Completed: {success_count}/{total_users}")
+        
     except Exception as e:
         set_broadcast_state_to_sheet(tele_id, "FAILED", message_id)
-        tg_send(chat_id, f"❌ <b>LỖI GỬI THÔNG BÁO</b>\n\n{str(e)}")
+        tg_send(
+            chat_id,
+            f"❌ <b>LỖI GỬI THÔNG BÁO</b>\n\n{str(e)}"
+        )
+        print(f"[BROADCAST] ❌ Error: {e}")
+        import traceback
         traceback.print_exc()
-
+    
     finally:
+        # 10. Mở khóa
         IS_BROADCASTING = False
 
 # =========================================================
@@ -1891,7 +1930,8 @@ def handle_thongbao(chat_id: Any, tele_id: Any, username: str, text: str, messag
 # =========================================================
 def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
     """Xử lý khi user bấm nút Get Cookie QR"""
-
+    
+    # 1. Kiểm tra user có trong sheet không
     row_idx, user = get_user_row(tele_id)
     if not user:
         tg_send(
@@ -1901,55 +1941,82 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
             main_keyboard()
         )
         return
-
+    
+    # 2. Kiểm tra band
     is_band, until = check_band(row_idx)
     if is_band:
-        tg_send(chat_id, "🚫 <b>Tài khoản đang bị khóa</b>\n\n" f"⏱️ Mở lại lúc: <b>{until.strftime('%H:%M %d/%m')}</b>")
+        tg_send(
+            chat_id,
+            "🚫 <b>Tài khoản đang bị khóa</b>\n\n"
+            f"⏱️ Mở lại lúc: <b>{until.strftime('%H:%M %d/%m')}</b>"
+        )
         return
-
-    # Payment
+    
+    # 3. Kiểm tra payment nếu có
     balance = get_balance(user)
     if BOT1_API_URL and PRICE_GET_COOKIE > 0:
         success, current_balance, error = check_balance_bot1(tele_id)
         if not success:
             tg_send(chat_id, f"❌ Lỗi check số dư: {error}")
             return
+        
         if current_balance < PRICE_GET_COOKIE:
-            tg_send(chat_id, format_insufficient_balance_msg(current_balance, PRICE_GET_COOKIE))
+            tg_send(
+                chat_id,
+                format_insufficient_balance_msg(current_balance, PRICE_GET_COOKIE)
+            )
             return
-
-    # Cooldown QR (60s) — lấy session gần nhất trong RAM
+    
+    # 4. Check cooldown QR (60s)
     current_time = time.time()
-    with qr_lock:
-        user_sessions = [s for s in qr_sessions.values() if s.get("user_id") == tele_id]
-
+    user_sessions = [s for s in qr_sessions.values() if s["user_id"] == tele_id]
+    
     if user_sessions:
-        latest_session = max(user_sessions, key=lambda x: x.get("created", 0))
-        time_since_last = current_time - latest_session.get("created", 0)
+        latest_session = max(user_sessions, key=lambda x: x["created"])
+        time_since_last = current_time - latest_session["created"]
+        
         if time_since_last < QR_COOLDOWN_SECONDS:
             wait_time = int(QR_COOLDOWN_SECONDS - time_since_last)
-            tg_send(chat_id, f"⏳ <b>VUI LÒNG ĐỢI {wait_time}s</b>\n\nChờ {wait_time} giây nữa trước khi tạo QR mới.")
+            tg_send(
+                chat_id,
+                f"⏳ <b>VUI LÒNG ĐỢI {wait_time}s</b>\n\n"
+                f"Chờ {wait_time} giây nữa trước khi tạo QR mới."
+            )
             return
-
+    
+    # 5. Tạo QR session
     tg_send(chat_id, "🔄 <b>Đang tạo mã QR đăng nhập Shopee...</b>")
-
-    success, session_id, qr_image = create_qr_session(tele_id)
+    
+    success, result, qr_image = create_qr_session(tele_id)
+    
     if not success:
-        tg_send(chat_id, f"❌ <b>Lỗi tạo QR:</b>\n{session_id}", main_keyboard())
+        tg_send(
+            chat_id,
+            f"❌ <b>Lỗi tạo QR:</b>\n{result}",
+            main_keyboard()
+        )
         return
-
-    # Trừ tiền
+    
+    session_id = result
+    
+    # 6. Trừ tiền nếu có payment
     new_balance = balance
     if BOT1_API_URL and PRICE_GET_COOKIE > 0:
         success, new_balance, error = deduct_balance_bot1(
             tele_id, PRICE_GET_COOKIE, "Get Cookie QR Shopee", username
         )
         if not success:
-            tg_send(chat_id, f"❌ <b>Không trừ được tiền:</b>\n{error}", main_keyboard())
-            with qr_lock:
-                qr_sessions.pop(session_id, None)
+            tg_send(
+                chat_id,
+                f"❌ <b>Không trừ được tiền:</b>\n{error}",
+                main_keyboard()
+            )
+            # Xóa session nếu không trừ được tiền
+            if session_id in qr_sessions:
+                del qr_sessions[session_id]
             return
-
+    
+    # 7. Gửi QR cho user
     caption = (
         "🔑 <b>QR LOGIN SHOPEE</b>\n\n"
         "1️⃣ <b>Mở app Shopee</b>\n"
@@ -1958,14 +2025,21 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
         "⚠️ QR có hiệu lực trong <b>5 phút</b>\n"
         "📱 Sau khi quét, bấm <b>🔄 Check QR Status</b>"
     )
-
+    
     try:
         tg_send_photo(chat_id, qr_image, caption)
-    except Exception:
-        tg_send(chat_id, f"{caption}\n\n❌ <b>Không thể tạo ảnh QR, vui lòng thử lại sau.</b>")
-
+    except:
+        # Fallback nếu không gửi được ảnh
+        tg_send(
+            chat_id,
+            f"{caption}\n\n"
+            f"❌ <b>Không thể tạo ảnh QR, vui lòng thử lại sau.</b>"
+        )
+    
+    # 8. Log
     log_qr(tele_id, username, session_id, "created", new_balance, "QR created")
-
+    
+    # 9. Hướng dẫn tiếp theo
     tg_send(
         chat_id,
         "📱 <b>Sau khi quét QR trên app Shopee:</b>\n"
@@ -1976,21 +2050,28 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
 
 def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
     """Kiểm tra trạng thái QR"""
-
-    with qr_lock:
-        user_sessions = [sid for sid, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
-
+    
+    # Tìm session của user
+    user_sessions = [sid for sid, sess in qr_sessions.items() if sess["user_id"] == tele_id]
+    
     if not user_sessions:
-        tg_send(chat_id, "❌ <b>Không tìm thấy QR session</b>\n\nBấm <b>🔑 Get Cookie QR</b> để tạo QR mới.", main_keyboard())
+        tg_send(
+            chat_id,
+            "❌ <b>Không tìm thấy QR session</b>\n\n"
+            "Bấm <b>🔑 Get Cookie QR</b> để tạo QR mới.",
+            main_keyboard()
+        )
         return
-
-    with qr_lock:
-        session_id = max(user_sessions, key=lambda sid: qr_sessions[sid].get("created", 0))
-
+    
+    # Lấy session mới nhất
+    session_id = max(user_sessions, key=lambda sid: qr_sessions[sid]["created"])
+    session = qr_sessions[session_id]
+    
+    # Check status
     tg_send(chat_id, "🔄 <b>Đang kiểm tra trạng thái QR...</b>")
-
+    
     success, status, has_token = check_qr_status(session_id)
-
+    
     if not success:
         if status == "EXPIRED":
             tg_send(
@@ -2000,16 +2081,23 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
                 "👉 Bấm <b>🔑 Get Cookie QR</b> để tạo QR mới.",
                 main_keyboard()
             )
-            with qr_lock:
-                qr_sessions.pop(session_id, None)
+            # Xóa session
+            if session_id in qr_sessions:
+                del qr_sessions[session_id]
         else:
-            tg_send(chat_id, f"❌ <b>Lỗi kiểm tra QR:</b>\n{status}", get_cookie_keyboard())
+            tg_send(
+                chat_id,
+                f"❌ <b>Lỗi kiểm tra QR:</b>\n{status}",
+                get_cookie_keyboard()
+            )
         return
-
+    
     if status == "SCANNED" or has_token:
+        # QR đã được quét, lấy cookie
         tg_send(chat_id, "✅ <b>QR đã được quét!</b>\n🔄 Đang lấy cookie...")
-
+        
         success, cookie = get_qr_cookie(session_id)
+        
         if not success:
             tg_send(
                 chat_id,
@@ -2018,29 +2106,35 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
                 get_cookie_keyboard()
             )
             return
-
+        
+        # Trả cookie cho user
+        masked_cookie = mask_value(cookie)
+        
         tg_send(
             chat_id,
-            "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
-            "🔐 <b>Cookie của bạn:</b>\n"
+            f"🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
+            f"🔐 <b>Cookie của bạn:</b>\n"
             f"<code>{esc(cookie)}</code>\n\n"
-            "📋 <b>Để check đơn hàng:</b>\n"
-            "Gửi cookie trên cho bot (copy toàn bộ).\n\n"
-            "⚠️ <b>Lưu ý:</b>\n"
-            "• Cookie có hiệu lực ~30 ngày\n"
-            "• Không chia sẻ cookie cho người khác\n"
-            "• Bảo mật tuyệt đối!",
+            f"📋 <b>Để check đơn hàng:</b>\n"
+            f"Gửi cookie trên cho bot (copy toàn bộ).\n\n"
+            f"⚠️ <b>Lưu ý:</b>\n"
+            f"• Cookie có hiệu lực ~30 ngày\n"
+            f"• Không chia sẻ cookie cho người khác\n"
+            f"• Bảo mật tuyệt đối!",
             main_keyboard()
         )
-
+        
+        # Log thành công
         row_idx, user = get_user_row(tele_id)
         balance = get_balance(user) if user else 0
         log_qr(tele_id, username, session_id, "success", balance, "Cookie retrieved")
-
-        with qr_lock:
-            qr_sessions.pop(session_id, None)
-
+        
+        # Xóa session sau khi thành công
+        if session_id in qr_sessions:
+            del qr_sessions[session_id]
+            
     else:
+        # Chưa quét
         tg_send(
             chat_id,
             "⏳ <b>CHƯA QUÉT QR</b>\n\n"
@@ -2051,46 +2145,36 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
 
 def handle_cancel_qr(chat_id: Any, tele_id: Any, username: str) -> None:
     """Hủy QR session"""
-
-    with qr_lock:
-        user_sessions = [sid for sid, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
-
-        if not user_sessions:
-            tg_send(chat_id, "❌ <b>Không có QR nào đang chờ</b>", main_keyboard())
-            return
-
-        for session_id in user_sessions:
-            qr_sessions.pop(session_id, None)
-
+    
+    # Tìm session của user
+    user_sessions = [sid for sid, sess in qr_sessions.items() if sess["user_id"] == tele_id]
+    
+    if not user_sessions:
+        tg_send(
+            chat_id,
+            "❌ <b>Không có QR nào đang chờ</b>",
+            main_keyboard()
+        )
+        return
+    
+    # Xóa tất cả session của user
+    for session_id in user_sessions:
+        if session_id in qr_sessions:
+            del qr_sessions[session_id]
+    
     tg_send(
         chat_id,
-        "✅ <b>Đã hủy tất cả QR session</b>\n\nBạn có thể tạo QR mới khi cần.",
+        "✅ <b>Đã hủy tất cả QR session</b>\n\n"
+        "Bạn có thể tạo QR mới khi cần.",
         main_keyboard()
     )
-
+    
+    # Log
     log_qr(tele_id, username, "multiple", "cancelled", 0, "QR cancelled")
 
 # =========================================================
 # WEBHOOK HANDLER
 # =========================================================
-def _prune_spam_cache_for_user(tid: str, keep_minutes: int = 3) -> None:
-    """Giữ lại vài phút gần nhất để tránh spam_cache phình"""
-    # minute_key format: YYYY-mm-dd HH:MM
-    try:
-        now_dt = now().replace(second=0, microsecond=0)
-        allowed = set()
-        for i in range(keep_minutes):
-            allowed.add((now_dt - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"))
-
-        with spam_lock:
-            mp = spam_cache.get(tid, {})
-            for k in list(mp.keys()):
-                if k not in allowed:
-                    mp.pop(k, None)
-            spam_cache[tid] = mp
-    except Exception:
-        pass
-
 def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: Dict[str, Any]) -> None:
     if text == "/start":
         tg_send(
@@ -2100,21 +2184,25 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             main_keyboard()
         )
         return
-
+    
+    # ========== THÔNG BÁO (ADMIN ONLY) ==========
     if text.startswith("/thongbao"):
+        # Lấy message_id từ message object
         msg_obj = data.get("message", {})
         message_id = msg_obj.get("message_id", 0)
+        
         handle_thongbao(chat_id, tele_id, username, text, message_id)
         return
 
+    # ========== GET COOKIE QR ==========
     if text == "🔑 Get Cookie QR":
         handle_get_cookie_qr(chat_id, tele_id, username)
         return
-
+    
     if text == "🔄 Check QR Status":
         handle_check_qr_status(chat_id, tele_id, username)
         return
-
+    
     if text == "❌ Cancel QR":
         handle_cancel_qr(chat_id, tele_id, username)
         return
@@ -2133,8 +2221,9 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             )
             return
 
+        # Lấy cột "Trạng Thái" (có thể là "trang thai" hoặc "trạng thái")
         status = safe_text(
-            user.get("trang thai")
+            user.get("trang thai")  # Cột D: "Trạng Thái"
             or user.get("trạng thái")
             or user.get("Trang Thái")
             or user.get("status")
@@ -2163,7 +2252,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             main_keyboard()
         )
         return
-
+        
     if text == "📘 Hướng dẫn":
         tg_send(
             chat_id,
@@ -2197,17 +2286,34 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
         row_idx, user = get_user_row(tele_id)
 
         if not user:
-            tg_send(chat_id, "❌ <b>Bạn chưa kích hoạt</b>\n\n👉 Kích hoạt tại @nganmiu_bot", main_keyboard())
+            tg_send(
+                chat_id,
+                "❌ <b>Bạn chưa kích hoạt</b>\n\n"
+                "👉 Kích hoạt tại @nganmiu_bot",
+                main_keyboard()
+            )
             return
 
         balance = get_balance(user)
-        tg_send(chat_id, f"💰 <b>SỐ DƯ HIỆN TẠI</b>\n\n{balance:,} đ", main_keyboard())
+
+        tg_send(
+            chat_id,
+            f"💰 <b>SỐ DƯ HIỆN TẠI</b>\n\n"
+            f"{balance:,} đ",
+            main_keyboard()
+        )
         return
 
     if text == "💳 Nạp Tiền":
-        tg_send(chat_id, "💳 <b>NẠP TIỀN</b>\n\n👉 Vui lòng nạp tiền tại bot chính:\n💸 @nganmiu_bot", main_keyboard())
+        tg_send(
+            chat_id,
+            "💳 <b>NẠP TIỀN</b>\n\n"
+            "👉 Vui lòng nạp tiền tại bot chính:\n"
+            "💸 @nganmiu_bot",
+            main_keyboard()
+        )
         return
-
+        
     if text == "🧩 Hệ Thống Bot NgânMiu":
         tg_send(
             chat_id,
@@ -2229,7 +2335,7 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             main_keyboard()
         )
         return
-
+        
     if is_ghn_code(text):
         result = check_ghn(text)
         tg_send(chat_id, result)
@@ -2247,18 +2353,21 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
 
     is_band, until = check_band(row_idx)
     if is_band:
-        tg_send(chat_id, "🚫 <b>Tài khoản đang bị khóa</b>\n\n" f"⏱️ Mở lại lúc: <b>{until.strftime('%H:%M %d/%m')}</b>")
+        tg_send(
+            chat_id,
+            "🚫 <b>Tài khoản đang bị khóa</b>\n\n"
+            f"⏱️ Mở lại lúc: <b>{until.strftime('%H:%M %d/%m')}</b>"
+        )
         return
 
     lines = split_lines(text)
-    values = [v.strip() for v in lines if is_cookie(v.strip()) or is_spx(v.strip()) or is_ghn_code(v.strip())]
+    values = [v.strip() for v in lines if is_cookie(v.strip()) or is_spx(v.strip())]
     if not values:
         tg_send(
             chat_id,
             "❌ <b>Dữ liệu không hợp lệ</b>\n\n"
             "🪙 Cookie: <code>SPC_ST=.xxxxx</code>\n"
-            "🚚 SPX: <code>SPXVNxxxxx</code>\n"
-            "🚛 GHN: <code>GHN...</code>",
+            "🚚 SPX: <code>SPXVNxxxxx</code>",
             main_keyboard()
         )
         return
@@ -2268,16 +2377,11 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
     for val in values:
         minute_key = now().strftime("%Y-%m-%d %H:%M")
         tid = safe_text(tele_id)
+        spam_cache.setdefault(tid, {})
+        spam_cache[tid][minute_key] = spam_cache[tid].get(minute_key, 0) + 1
 
-        _prune_spam_cache_for_user(tid, keep_minutes=3)
-
-        with spam_lock:
-            spam_cache.setdefault(tid, {})
-            spam_cache[tid][minute_key] = spam_cache[tid].get(minute_key, 0) + 1
-            count_min = spam_cache[tid][minute_key]
-
-        if count_min > SPAM_LIMIT_PER_MIN:
-            strike, band_until = inc_strike_and_band(row_idx, tele_id, username, count_min)
+        if spam_cache[tid][minute_key] > SPAM_LIMIT_PER_MIN:
+            strike, band_until = inc_strike_and_band(row_idx, tele_id, username, spam_cache[tid][minute_key])
             tg_send(
                 chat_id,
                 "🚫 <b>SPAM PHÁT HIỆN</b>\n\n"
@@ -2286,8 +2390,15 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             )
             return
 
-        # FREE LOGIC
-        if balance <= 10000:
+        # ================= FREE LOGIC =================
+        # Balance > 10,000đ → Dùng FREE không giới hạn
+        # Balance ≤ 10,000đ → Giới hạn 10 lượt/ngày
+        
+        if balance > 10000:
+            # User có nhiều tiền → Dùng FREE không giới hạn
+            print(f"[FREE] User {tele_id} balance={balance:,}đ > 10,000đ → FREE unlimited")
+        else:
+            # User ít tiền → Giới hạn 10 lượt/ngày
             used = count_today_request(tele_id)
             if used >= FREE_LIMIT_PER_DAY:
                 tg_send(
@@ -2299,18 +2410,28 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
                     f"👉 Nạp thêm để số dư > 10,000đ tại @nganmiu_bot"
                 )
                 return
+            print(f"[FREE] User {tele_id} balance={balance:,}đ ≤ 10,000đ → Free limited: {used}/{FREE_LIMIT_PER_DAY}")
 
-        # DO CHECK
+        # ================= DO CHECK =================
         if is_cookie(val):
-            result, err = check_shopee_orders(val)
+            result, error = check_shopee_orders(val)
 
             if not result:
-                if err == "cookie_expired":
-                    tg_send(chat_id, "🔒 <b>COOKIE KHÔNG HỢP LỆ</b>\n\n❌ Cookie đã <b>hết hạn</b> hoặc <b>bị Shopee khóa</b>.")
+                if error == "cookie_expired":
+                    tg_send(
+                        chat_id,
+                        "🔒 <b>COOKIE KHÔNG HỢP LỆ</b>\n\n"
+                        "❌ Cookie đã <b>hết hạn</b> hoặc <b>bị Shopee khóa</b>."
+                    )
                     log_check(tele_id, username, val, balance, "cookie_expired")
                 else:
-                    tg_send(chat_id, "📭 <b>KHÔNG CÓ ĐƠN HÀNG</b>\n\nCookie hợp lệ nhưng hiện <b>không có đơn nào</b>.")
-                    log_check(tele_id, username, val, balance, f"no_orders:{err or ''}")
+                    tg_send(
+                        chat_id,
+                        "📭 <b>KHÔNG CÓ ĐƠN HÀNG</b>\n\n"
+                        "Cookie hợp lệ nhưng hiện <b>không có đơn nào</b>."
+                    )
+                    log_check(tele_id, username, val, balance, "no_orders")
+
             else:
                 tg_send(chat_id, result)
                 log_check(tele_id, username, val, balance, "check_orders")
@@ -2319,11 +2440,6 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             result = check_spx(val)
             tg_send(chat_id, result)
             log_check(tele_id, username, val, balance, "check_spx")
-
-        elif is_ghn_code(val):
-            result = check_ghn(val)
-            tg_send(chat_id, result)
-            log_check(tele_id, username, val, balance, "check_ghn")
 
         time.sleep(0.2)
 
@@ -2351,7 +2467,7 @@ def webhook_root():
         return "OK"
 
     try:
-        _handle_message(chat_id, tele_id, username, text, data)
+        _handle_message(chat_id, tele_id, username, text, data)  # ← Truyền data vào
     except Exception:
         err = traceback.format_exc()
         tg_send(chat_id, "❌ Bot gặp lỗi nội bộ, bạn gửi lại sau nhé.")
@@ -2378,7 +2494,7 @@ log_thread.start()
 def cleanup_qr_worker():
     """Thread dọn dẹp QR sessions hết hạn"""
     while True:
-        time.sleep(60)
+        time.sleep(60)  # 1 phút check 1 lần
         cleaned = cleanup_qr_sessions()
         if cleaned > 0:
             print(f"[QR] Cleaned {cleaned} expired sessions")
@@ -2399,14 +2515,15 @@ if __name__ == "__main__":
     print("✅ Log worker thread started")
     print("✅ QR cleanup thread started")
     print("=" * 50)
-
+    
+    # Cleanup cache định kỳ mỗi 5 phút
     def cleanup_cache_worker():
         while True:
             time.sleep(300)  # 5 phút
             clear_expired_cache()
             print("[CACHE] Cleaned expired cache")
-
+    
     cache_thread = threading.Thread(target=cleanup_cache_worker, daemon=True)
     cache_thread.start()
-
+    
     app.run(host="0.0.0.0", port=5000, debug=False)
