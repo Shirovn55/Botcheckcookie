@@ -87,7 +87,7 @@ if BOT1_API_URL:
     PRICE_CHECK_COOKIE = int(os.getenv("PRICE_CHECK_COOKIE", "10"))
     PRICE_CHECK_SPX = int(os.getenv("PRICE_CHECK_SPX", "10"))
     PRICE_CHECK_GHN = int(os.getenv("PRICE_CHECK_GHN", "10"))
-    PRICE_GET_COOKIE = int(os.getenv("PRICE_GET_COOKIE", "15"))  # Phí lấy cookie mới
+    PRICE_GET_COOKIE = int(os.getenv("PRICE_GET_COOKIE", "50"))  # Phí lấy cookie mới (thu khi lấy thành công)  # Phí lấy cookie mới
     print(f"[PAYMENT] Active: {PRICE_CHECK_COOKIE}đ/check, {PRICE_GET_COOKIE}đ/get_cookie")
 else:
     PRICE_CHECK_COOKIE = PRICE_CHECK_SPX = PRICE_CHECK_GHN = PRICE_GET_COOKIE = 0
@@ -95,7 +95,7 @@ else:
 
 # QR API Configuration
 QR_API_BASE = os.getenv("QR_API_BASE", "https://qr-shopee-puce.vercel.app").strip()
-QR_POLL_INTERVAL = float(os.getenv("QR_POLL_INTERVAL", "1.0"))  # giây check 1 lần (tăng tốc)
+QR_POLL_INTERVAL = float(os.getenv("QR_POLL_INTERVAL", "3.0"))  # giây check 1 lần  # giây check 1 lần (tăng tốc)
 QR_TIMEOUT = 300  # 5 phút timeout
 
 
@@ -938,14 +938,14 @@ def tg_send(chat_id: Any, text: str, keyboard: Optional[Dict[str, Any]] = None) 
     except Exception:
         pass
 
-def tg_send_photo(chat_id: Any, photo_base64: str, caption: str = "") -> None:
-    """Gửi ảnh từ base64"""
+def tg_send_photo(chat_id: Any, photo_base64: str, caption: str = "", keyboard: Optional[Dict[str, Any]] = None) -> None:
+    """Gửi ảnh từ base64 (hỗ trợ inline keyboard)"""
     try:
         # Decode base64
         photo_bytes = base64.b64decode(photo_base64)
 
         # Tạo file object
-        files = {'photo': ('qr.png', photo_bytes, 'image/png')}
+        files = {"photo": ("qr.png", photo_bytes, "image/png")}
 
         payload = {
             "chat_id": chat_id,
@@ -953,11 +953,15 @@ def tg_send_photo(chat_id: Any, photo_base64: str, caption: str = "") -> None:
             "parse_mode": "HTML"
         }
 
+        # ⚠️ Với multipart/form-data, reply_markup nên là JSON string
+        if keyboard:
+            payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
         requests.post(f"{BASE_URL}/sendPhoto", data=payload, files=files, timeout=15)
     except Exception as e:
         print(f"[ERROR] Send photo failed: {e}")
         # Fallback gửi text
-        tg_send(chat_id, f"📷 {caption}\n\n❌ Không thể gửi ảnh QR, vui lòng thử lại.")
+        tg_send(chat_id, f"📷 {caption}\\n\\n❌ Không thể gửi ảnh QR, vui lòng thử lại.")
 
 def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
     try:
@@ -988,6 +992,18 @@ def get_cookie_keyboard():
         "resize_keyboard": True
     }
 
+def inline_qr_keyboard(session_id: str) -> Dict[str, Any]:
+    """Inline keyboard nằm ngay dưới ảnh QR"""
+    sid = safe_text(session_id)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Check QR Status", "callback_data": f"QR_CHECK|{sid}"},
+                {"text": "❌ Cancel QR", "callback_data": f"QR_CANCEL|{sid}"}
+            ]
+        ]
+    }
+
 # =========================================================
 # CALLBACK HANDLER
 # =========================================================
@@ -1008,6 +1024,17 @@ def handle_callback_query(data: Dict[str, Any]) -> None:
     chat_id  = (message.get("chat") or {}).get("id")
 
     action = cq.get("data", "")
+
+    # ================= INLINE QR BUTTONS =================
+    if action.startswith("QR_CHECK|"):
+        sid = action.split("|", 1)[1].strip()
+        handle_check_qr_status(chat_id, tele_id, username, sid)
+        return
+
+    if action.startswith("QR_CANCEL|"):
+        sid = action.split("|", 1)[1].strip()
+        handle_cancel_qr(chat_id, tele_id, username, sid)
+        return
 
     row_idx, user = get_user_row(tele_id)
 
@@ -1960,33 +1987,22 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
         tg_send(chat_id, f"❌ <b>Lỗi tạo QR:</b>\n{session_id}", main_keyboard())
         return
 
-    # Trừ tiền
-    new_balance = balance
-    if BOT1_API_URL and PRICE_GET_COOKIE > 0:
-        success, new_balance, error = deduct_balance_bot1(
-            tele_id, PRICE_GET_COOKIE, "Get Cookie QR Shopee", username
-        )
-        if not success:
-            tg_send(chat_id, f"❌ <b>Không trừ được tiền:</b>\n{error}", main_keyboard())
-            with qr_lock:
-                qr_sessions.pop(session_id, None)
-            return
-
     caption = (
         "🔑 <b>QR LOGIN SHOPEE</b>\n\n"
         "1️⃣ <b>Mở app Shopee</b>\n"
         "2️⃣ <b>Vào Cá nhân → Cài đặt → Quét mã QR</b>\n"
         "3️⃣ <b>Quét mã bên dưới</b>\n\n"
         "⚠️ QR có hiệu lực trong <b>5 phút</b>\n"
-        "📱 Sau khi quét, bấm <b>🔄 Check QR Status</b>"
+        "🤖 Bot sẽ <b>tự kiểm tra</b> mỗi <b>3 giây</b> và tự trả cookie sau khi bạn quét.\n"
+        "👉 Nếu chưa thấy trả cookie, bấm <b>🔄 Check QR Status</b> ngay dưới ảnh"
     )
 
     try:
-        tg_send_photo(chat_id, qr_image, caption)
+        tg_send_photo(chat_id, qr_image, caption, keyboard=inline_qr_keyboard(session_id))
     except Exception:
         tg_send(chat_id, f"{caption}\n\n❌ <b>Không thể tạo ảnh QR, vui lòng thử lại sau.</b>")
 
-    log_qr(tele_id, username, session_id, "created", new_balance, "QR created")
+    log_qr(tele_id, username, session_id, "created", (current_balance if BOT1_API_URL else balance), "QR created")
 
     # Lưu thêm thông tin để auto watcher có thể gửi lại cookie
     with qr_lock:
@@ -1994,6 +2010,8 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
             qr_sessions[session_id]["chat_id"] = chat_id
             qr_sessions[session_id]["username"] = username
             qr_sessions[session_id]["cancelled"] = False
+            qr_sessions[session_id]["paid"] = False
+            qr_sessions[session_id]["fee"] = PRICE_GET_COOKIE
 
     # ✅ AUTO (FAST): chờ nhanh trong CHÍNH request này (giúp serverless trả cookie nhanh nếu bạn quét liền)
     if AUTO_QR:
@@ -2105,7 +2123,79 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
             pass
 
 def _send_cookie_success(chat_id: Any, tele_id: Any, username: str, session_id: str, cookie: str) -> None:
-    """Gửi cookie thành công + log + dọn session"""
+    """
+    Gửi cookie thành công.
+    ✅ Thu phí (PRICE_GET_COOKIE) CHỈ khi gửi cookie thành công.
+    ✅ Nếu trừ tiền lỗi / không đủ tiền: giữ session + giữ cookie để user nạp và bấm lại.
+    """
+    fee = PRICE_GET_COOKIE if BOT1_API_URL else 0
+
+    # Lấy config từ session (nếu có)
+    with qr_lock:
+        sess = qr_sessions.get(session_id, {}) if session_id else {}
+    if sess:
+        fee = safe_int(sess.get("fee"), fee)
+        already_paid = bool(sess.get("paid"))
+    else:
+        already_paid = False
+
+    balance_after = 0
+
+    # ================= PAYMENT (chỉ khi bot1 active) =================
+    if BOT1_API_URL and fee > 0 and not already_paid:
+        ok_bal, bal, err = check_balance_bot1(tele_id)
+        if not ok_bal:
+            tg_send(
+                chat_id,
+                f"⚠️ <b>Lỗi hệ thống thanh toán:</b> {esc(err)}\n\n"
+                "👉 Bạn có thể bấm <b>🔄 Check QR Status</b> để thử lại.",
+                get_cookie_keyboard()
+            )
+            log_qr(tele_id, username, session_id, "pay_error", 0, f"check_balance error: {err}")
+            return
+
+        if bal < fee:
+            tg_send(
+                chat_id,
+                format_insufficient_balance_msg(bal, fee) +
+                "\n\n👉 Nạp xong, bấm <b>🔄 Check QR Status</b> để nhận cookie.",
+                main_keyboard()
+            )
+            log_qr(tele_id, username, session_id, "no_money", bal, "insufficient for get_cookie")
+            return
+
+        ok_d, new_bal, err2 = deduct_balance_bot1(
+            tele_id, fee, "Get Cookie QR Shopee (success)", username
+        )
+        if not ok_d:
+            tg_send(
+                chat_id,
+                f"⚠️ <b>Không trừ được tiền:</b> {esc(err2)}\n\n"
+                "👉 Bạn có thể bấm <b>🔄 Check QR Status</b> để thử lại.",
+                get_cookie_keyboard()
+            )
+            log_qr(tele_id, username, session_id, "pay_fail", bal, f"deduct failed: {err2}")
+            return
+
+        balance_after = new_bal
+        with qr_lock:
+            if session_id in qr_sessions:
+                qr_sessions[session_id]["paid"] = True
+
+    elif BOT1_API_URL and fee > 0 and already_paid:
+        # Đã thu tiền trước đó (user bấm lại) → lấy số dư mới nhất để hiển thị
+        ok_bal, bal, _ = check_balance_bot1(tele_id)
+        balance_after = bal if ok_bal else 0
+
+    # ================= SEND COOKIE =================
+    extra_fee_text = ""
+    if BOT1_API_URL and fee > 0:
+        extra_fee_text = (
+            "\n\n━━━━━━━━━━━━━━━\n"
+            f"💸 <b>Phí lấy cookie:</b> -{fee:,}đ\n"
+            f"💰 <b>Số dư còn:</b> {balance_after:,}đ"
+        )
+
     tg_send(
         chat_id,
         "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
@@ -2116,35 +2206,54 @@ def _send_cookie_success(chat_id: Any, tele_id: Any, username: str, session_id: 
         "⚠️ <b>Lưu ý:</b>\n"
         "• Cookie có hiệu lực ~30 ngày\n"
         "• Không chia sẻ cookie cho người khác\n"
-        "• Bảo mật tuyệt đối!",
+        "• Bảo mật tuyệt đối!"
+        + extra_fee_text,
         main_keyboard()
     )
 
-    row_idx, user = get_user_row(tele_id)
-    balance = get_balance(user) if user else 0
-    log_qr(tele_id, username, session_id, "success", balance, "Cookie retrieved (auto)")
+    log_qr(tele_id, username, session_id, "success", balance_after, "Cookie delivered")
 
     with qr_lock:
         qr_sessions.pop(session_id, None)
 
-def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
-    """Kiểm tra trạng thái QR"""
+def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str, session_id: Optional[str] = None) -> None:
+    """Kiểm tra trạng thái QR (hỗ trợ inline button theo session_id)"""
 
+    tele_id = int(tele_id) if safe_text(tele_id).isdigit() else tele_id
+
+    # Lấy session hợp lệ (ưu tiên session_id được truyền vào)
     with qr_lock:
-        user_sessions = [sid for sid, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
+        if session_id and session_id in qr_sessions and qr_sessions[session_id].get("user_id") == tele_id:
+            sid = session_id
+        else:
+            user_sessions = [s for s, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
+            sid = max(user_sessions, key=lambda s: qr_sessions[s].get("created", 0)) if user_sessions else None
 
-    if not user_sessions:
+    if not sid:
         tg_send(chat_id, "❌ <b>Không tìm thấy QR session</b>\n\nBấm <b>🔑 Get Cookie QR</b> để tạo QR mới.", main_keyboard())
         return
 
+    # Nếu session đã có cookie (ví dụ: quét xong nhưng chưa thu phí/ chưa gửi) → gửi luôn
     with qr_lock:
-        session_id = max(user_sessions, key=lambda sid: qr_sessions[sid].get("created", 0))
+        sess = qr_sessions.get(sid, {})
+        cached_cookie = safe_text(sess.get("cookie", "")).strip()
+        cancelled = bool(sess.get("cancelled", False))
+
+    if cancelled:
+        tg_send(chat_id, "❌ <b>QR đã bị hủy</b>\n\nBấm <b>🔑 Get Cookie QR</b> để tạo QR mới.", main_keyboard())
+        with qr_lock:
+            qr_sessions.pop(sid, None)
+        return
+
+    if cached_cookie:
+        _send_cookie_success(chat_id, tele_id, username, sid, cached_cookie)
+        return
 
     tg_send(chat_id, "🔄 <b>Đang kiểm tra trạng thái QR...</b>")
 
-    success, status, has_token = check_qr_status(session_id)
+    ok, status, has_token = check_qr_status(sid)
 
-    if not success:
+    if not ok:
         if status == "EXPIRED":
             tg_send(
                 chat_id,
@@ -2154,74 +2263,72 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str) -> None:
                 main_keyboard()
             )
             with qr_lock:
-                qr_sessions.pop(session_id, None)
+                qr_sessions.pop(sid, None)
         else:
-            tg_send(chat_id, f"❌ <b>Lỗi kiểm tra QR:</b>\n{status}", get_cookie_keyboard())
+            tg_send(chat_id, f"❌ <b>Lỗi kiểm tra QR:</b>\n{esc(status)}", get_cookie_keyboard())
         return
 
-    if status == "SCANNED" or has_token:
-        tg_send(chat_id, "✅ <b>QR đã được quét!</b>\n🔄 Đang lấy cookie...")
+    st = (status or "").strip().upper()
 
-        success, cookie = get_qr_cookie(session_id)
-        if not success:
+    # Shopee status có thể rất nhiều biến thể → dùng mapping mềm
+    if ok and (has_token or st in SCANNED_STATUSES or (st and st not in PENDING_STATUSES)):
+        tg_send(chat_id, "✅ <b>QR đã được quét!</b>\n\n🔄 Đang lấy cookie...")
+
+        ok2, cookie = get_qr_cookie(sid)
+        if not ok2:
             tg_send(
                 chat_id,
-                f"❌ <b>Lỗi lấy cookie:</b>\n{cookie}\n\n"
-                "👉 Thử quét QR lại hoặc tạo QR mới.",
+                f"❌ <b>Lỗi lấy cookie:</b>\n{esc(cookie)}\n\n"
+                "👉 Bạn có thể bấm <b>🔄 Check QR Status</b> để thử lại.",
                 get_cookie_keyboard()
             )
             return
 
-        tg_send(
-            chat_id,
-            "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
-            "🔐 <b>Cookie của bạn:</b>\n"
-            f"<code>{esc(cookie)}</code>\n\n"
-            "📋 <b>Để check đơn hàng:</b>\n"
-            "Gửi cookie trên cho bot (copy toàn bộ).\n\n"
-            "⚠️ <b>Lưu ý:</b>\n"
-            "• Cookie có hiệu lực ~30 ngày\n"
-            "• Không chia sẻ cookie cho người khác\n"
-            "• Bảo mật tuyệt đối!",
-            main_keyboard()
-        )
-
-        row_idx, user = get_user_row(tele_id)
-        balance = get_balance(user) if user else 0
-        log_qr(tele_id, username, session_id, "success", balance, "Cookie retrieved")
-
-        with qr_lock:
-            qr_sessions.pop(session_id, None)
-
-    else:
-        tg_send(
-            chat_id,
-            "⏳ <b>CHƯA QUÉT QR</b>\n\n"
-            "Mở app Shopee và quét mã QR đã gửi.\n\n"
-            "👉 Sau khi quét, bấm <b>🔄 Check QR Status</b> lại",
-            get_cookie_keyboard()
-        )
-
-def handle_cancel_qr(chat_id: Any, tele_id: Any, username: str) -> None:
-    """Hủy QR session"""
-
-    with qr_lock:
-        user_sessions = [sid for sid, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
-
-        if not user_sessions:
-            tg_send(chat_id, "❌ <b>Không có QR nào đang chờ</b>", main_keyboard())
-            return
-
-        for session_id in user_sessions:
-            qr_sessions.pop(session_id, None)
+        _send_cookie_success(chat_id, tele_id, username, sid, cookie)
+        return
 
     tg_send(
         chat_id,
-        "✅ <b>Đã hủy tất cả QR session</b>\n\nBạn có thể tạo QR mới khi cần.",
+        "⏳ <b>CHƯA QUÉT QR</b>\n\n"
+        "Mở app Shopee và quét mã QR đã gửi.\n\n"
+        "👉 Sau khi quét, bot sẽ tự check mỗi 3s. Nếu chưa thấy trả cookie, bấm <b>🔄 Check QR Status</b> lại.",
+        get_cookie_keyboard()
+    )
+
+
+def handle_cancel_qr(chat_id: Any, tele_id: Any, username: str, session_id: Optional[str] = None) -> None:
+    """Hủy QR session (hỗ trợ inline button theo session_id)"""
+
+    tele_id = int(tele_id) if safe_text(tele_id).isdigit() else tele_id
+
+    cancelled_any = False
+
+    with qr_lock:
+        if session_id and session_id in qr_sessions and qr_sessions[session_id].get("user_id") == tele_id:
+            qr_sessions.pop(session_id, None)
+            cancelled_any = True
+        else:
+            user_sessions = [sid for sid, sess in qr_sessions.items() if sess.get("user_id") == tele_id]
+            if not user_sessions:
+                cancelled_any = False
+            else:
+                for sid in user_sessions:
+                    qr_sessions.pop(sid, None)
+                cancelled_any = True
+
+    if not cancelled_any:
+        tg_send(chat_id, "❌ <b>Không có QR nào đang chờ</b>", main_keyboard())
+        return
+
+    tg_send(
+        chat_id,
+        "✅ <b>Đã hủy QR</b>\n\nBạn có thể tạo QR mới khi cần.",
         main_keyboard()
     )
 
-    log_qr(tele_id, username, "multiple", "cancelled", 0, "QR cancelled")
+    log_qr(tele_id, username, session_id or "multiple", "cancelled", 0, "QR cancelled")
+
+
 
 # =========================================================
 # WEBHOOK HANDLER
