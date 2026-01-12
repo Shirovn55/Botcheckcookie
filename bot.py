@@ -2029,7 +2029,7 @@ def handle_get_cookie_qr(chat_id: Any, tele_id: Any, username: str) -> None:
     caption = (
         "🔑 <b>QR LOGIN SHOPEE</b>\n\n"
         "1️⃣ <b>Mở app Shopee</b>\n"
-        "2️⃣ <b>Vào Cá nhân → Cài đặt → Quét mã QR</b>\n"
+        "2️⃣ <b>Ở Trang Chủ - Góc trên bên trái - Ô Vuông cạnh Shopee Pay - Bấm vào để Quét QR</b>\n"
         "3️⃣ <b>Quét mã bên dưới</b>\n\n"
         "⚠️ QR có hiệu lực trong <b>5 phút</b>\n"
         "🤖 Bot sẽ <b>tự kiểm tra</b> mỗi <b>3 giây</b> và tự trả cookie sau khi bạn quét.\n"
@@ -2285,6 +2285,9 @@ def _send_cookie_success(chat_id: Any, tele_id: Any, username: str, session_id: 
     if cookie_f:
         message += f"🍪 <b>Cookie F:</b>\n<code>{esc(cookie_f)}</code>\n\n"
     
+    # Hướng dẫn copy
+    message += "💡 <i>Tap vào cookie để auto copy</i>\n\n"
+    
     # Hiệu lực và lưu ý
     message += (
         f"⏰ <b>Hiệu lực:</b> {COOKIE_VALIDITY_DAYS} ngày (đến {expiry_date})\n"
@@ -2292,7 +2295,7 @@ def _send_cookie_success(chat_id: Any, tele_id: Any, username: str, session_id: 
         "━━━━━━━━━━━━━━━\n"
         "💡 <b>LƯU Ý:</b>\n"
         "• Để Lưu Voucher 100k:\n"
-        "👉 Vui lòng qua bot add voucher nhé"
+        "👉 @nganmiu_bot"
     )
 
     # Thêm thông tin phí (nếu có)
