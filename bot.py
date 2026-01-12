@@ -325,6 +325,10 @@ def get_qr_cookie(session_id: str) -> Tuple[bool, str, Optional[str], Optional[d
         cookie_st = data.get("cookie", "")
         cookie_f = data.get("cookie_f", "")
         
+        # ✅ Debug log
+        print(f"[QR] API Response - cookie_st: {cookie_st[:50] if cookie_st else 'None'}...")
+        print(f"[QR] API Response - cookie_f: {cookie_f[:50] if cookie_f else 'None'}")
+        
         if not cookie_st:
             return False, "No cookie returned", None, None
 
@@ -2272,8 +2276,7 @@ def _send_cookie_success(chat_id: Any, tele_id: Any, username: str, session_id: 
     
     # Thông tin user (nếu có)
     if user_info:
-        message += f"👤 <b>User:</b> <code>{esc(user_info.get('username', 'N/A'))}</code>\n"
-        message += f"🆔 <b>ID:</b> <code>{esc(str(user_info.get('user_id', 'N/A')))}</code>\n\n"
+        message += f"👤 <b>User:</b> <code>{esc(user_info.get('username', 'N/A'))}</code>\n\n"
     
     # Cookie ST
     message += f"🍪 <b>Cookie ST:</b>\n<code>{esc(cookie_st)}</code>\n\n"
@@ -2342,8 +2345,7 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str, session_id
         _send_cookie_success(chat_id, tele_id, username, sid, cached_cookie, cached_cookie_f, cached_user_info)
         return
 
-    tg_send(chat_id, "🔄 <b>Đang kiểm tra trạng thái QR...</b>")
-
+    # ✅ Bỏ thông báo "Đang kiểm tra..." - check trực tiếp
     ok, status, has_token, cookie_st, cookie_f = check_qr_status(sid)
 
     if not ok:
@@ -2365,8 +2367,7 @@ def handle_check_qr_status(chat_id: Any, tele_id: Any, username: str, session_id
 
     # Shopee status có thể rất nhiều biến thể → dùng mapping mềm
     if ok and (has_token or st in SCANNED_STATUSES or (st and st not in PENDING_STATUSES)):
-        tg_send(chat_id, "✅ <b>QR đã được quét!</b>\n\n🔄 Đang lấy cookie...")
-
+        # ✅ Bỏ thông báo "QR đã được quét! Đang lấy cookie..." - lấy luôn
         ok2, cookie, cookie_f2, user_info = get_qr_cookie(sid)
         if not ok2:
             tg_send(
@@ -2448,8 +2449,27 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
     if text == "/start":
         tg_send(
             chat_id,
-            "🤖 <b>BOT CHECK ĐƠN HÀNG SHOPEE + SPX + GET COOKIE QR</b>\n\n"
-            "Chọn chức năng bên dưới 👇",
+            "👋 <b>CHÀO MỪNG ĐẾN BOT NGÂNMIU!</b>\n\n"
+            "🤖 <b>Bot Check Đơn Hàng Shopee</b>\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "📦 <b>HỖ TRỢ CHECK:</b>\n"
+            "✅ Bằng Cookie Shopee\n"
+            "✅ Bằng MVĐ Shopee Express (SPX)\n"
+            "✅ Bằng MVĐ Giao Hàng Nhanh (GHN)\n\n"
+            "🔑 <b>HỖ TRỢ GET COOKIE:</b>\n"
+            "✅ Get Cookie qua QR Code (nhanh & an toàn)\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🧩 <b>HỆ THỐNG BOT NGÂNMIU</b>\n\n"
+            "🎟️ <b>Bot Lưu Voucher</b>\n"
+            "👉 @nganmiu_bot\n\n"
+            "📦 <b>Bot Check Đơn Hàng</b>\n"
+            "👉 @ShopeexCheck_Bot\n\n"
+            "🔑 <b>Bot Get Cookie QR</b>\n"
+            "👉 <i>Đã tích hợp trong bot này</i> ✅\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🧑‍💼 <b>Admin hỗ trợ:</b> @BonBonxHPx\n"
+            "👥 <b>Group Hỗ Trợ:</b> https://t.me/botxshopee\n\n"
+            "✨ <i>Book Đơn Mã New tại NganMiu.Store</i>",
             main_keyboard()
         )
         return
