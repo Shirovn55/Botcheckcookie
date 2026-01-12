@@ -265,15 +265,20 @@ def is_phone_number(text: str) -> bool:
     if not text:
         return False
     
+    # Lấy chỉ các chữ số
     digits = "".join(ch for ch in text if ch.isdigit())
     
+    # Kiểm tra độ dài
     if len(digits) < 10 or len(digits) > 11:
         return False
     
-    if digits.startswith("84"):
-        return len(digits) == 11
-    elif digits.startswith("0"):
-        return len(digits) == 10
+    # Kiểm tra prefix hợp lệ
+    if len(digits) == 11:
+        # Format: 84xxxxxxxxx
+        return digits.startswith("84")
+    elif len(digits) == 10:
+        # Format: 0xxxxxxxxx
+        return digits.startswith("0")
     
     return False
 
@@ -2804,13 +2809,9 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
         )
         return
 
-    if is_ghn_code(text):
-        result = check_ghn(text)
-        tg_send(chat_id, result)
-        return
-
-    # ✅ CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN (hỗ trợ max 10 số)
-    if is_phone_number(text) or '\n' in text and any(is_phone_number(line.strip()) for line in text.split('\n')):
+    # ✅ CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN TRƯỚC (tránh conflict với GHN)
+    # Vì is_ghn_code cũng nhận số 10 chữ số là GHN code
+    if is_phone_number(text) or ('\n' in text and any(is_phone_number(line.strip()) for line in text.split('\n'))):
         row_idx, user = get_user_row(tele_id)
         if not user:
             tg_send(
@@ -2835,85 +2836,94 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
         phones = extract_phone_numbers(text)
         
         if not phones:
-            return  # Không phải số điện thoại hợp lệ
-        
-        # Giới hạn 10 số
-        if len(phones) > 10:
-            tg_send(
-                chat_id,
-                f"⚠️ <b>QUÁ NHIỀU SỐ</b>\n\n"
-                f"📊 Bạn gửi {len(phones)} số\n"
-                f"🔢 Bot chỉ check tối đa 10 số/lần\n\n"
-                f"👉 Vui lòng gửi lại với tối đa 10 số",
-                main_keyboard()
-            )
-            return
-        
-        # Check spam
-        balance = get_balance(user)
-        minute_key = now().strftime("%Y-%m-%d %H:%M")
-        tid = safe_text(tele_id)
-
-        _prune_spam_cache_for_user(tid, keep_minutes=3)
-
-        with spam_lock:
-            spam_cache.setdefault(tid, {})
-            spam_cache[tid][minute_key] = spam_cache[tid].get(minute_key, 0) + len(phones)
-            count_min = spam_cache[tid][minute_key]
-
-        if count_min > SPAM_LIMIT_PER_MIN:
-            strike, band_until = inc_strike_and_band(row_idx, tele_id, username, count_min)
-            tg_send(
-                chat_id,
-                "🚫 <b>SPAM PHÁT HIỆN</b>\n\n"
-                f"⚠️ Strike: <b>{strike}</b>\n"
-                f"⏱️ Band tới: <b>{band_until.strftime('%H:%M %d/%m')}</b>"
-            )
-            return
-        
-        # Gửi thông báo đang check
-        if len(phones) == 1:
-            tg_send(chat_id, f"🔄 <b>Đang kiểm tra số {phones[0]}...</b>")
+            # Không extract được số → có thể là GHN code, để check tiếp
+            pass
         else:
-            tg_send(chat_id, f"🔄 <b>Đang kiểm tra {len(phones)} số...</b>")
-        
-        # Check tất cả số
-        results = check_multiple_phones(phones)
-        
-        # Xây dựng message kết quả
-        zin_count = sum(1 for r in results if r.get("success") and r.get("is_zin"))
-        not_zin_count = sum(1 for r in results if r.get("success") and not r.get("is_zin"))
-        error_count = sum(1 for r in results if not r.get("success"))
-        
-        result_msg = f"📊 <b>KẾT QUẢ CHECK {len(phones)} SỐ</b>\n\n"
-        result_msg += f"✅ Số zin: <b>{zin_count}</b>\n"
-        result_msg += f"❌ Số không zin: <b>{not_zin_count}</b>\n"
-        
-        if error_count > 0:
-            result_msg += f"⚠️ Lỗi: <b>{error_count}</b>\n"
-        
-        result_msg += "\n━━━━━━━━━━━━━━━\n"
-        
-        # Chi tiết từng số
-        for r in results:
-            phone = r["phone"]
-            success = r["success"]
-            is_zin = r["is_zin"]
-            note = r["note"]
+            # Có số điện thoại → check số
             
-            if not success:
-                result_msg += f"\n⚠️ <code>{phone}</code> - Lỗi: {note}"
-            elif is_zin:
-                result_msg += f"\n✅ <code>{phone}</code> - ZIN"
+            # Giới hạn 10 số
+            if len(phones) > 10:
+                tg_send(
+                    chat_id,
+                    f"⚠️ <b>QUÁ NHIỀU SỐ</b>\n\n"
+                    f"📊 Bạn gửi {len(phones)} số\n"
+                    f"🔢 Bot chỉ check tối đa 10 số/lần\n\n"
+                    f"👉 Vui lòng gửi lại với tối đa 10 số",
+                    main_keyboard()
+                )
+                return
+            
+            # Check spam
+            balance = get_balance(user)
+            minute_key = now().strftime("%Y-%m-%d %H:%M")
+            tid = safe_text(tele_id)
+
+            _prune_spam_cache_for_user(tid, keep_minutes=3)
+
+            with spam_lock:
+                spam_cache.setdefault(tid, {})
+                spam_cache[tid][minute_key] = spam_cache[tid].get(minute_key, 0) + len(phones)
+                count_min = spam_cache[tid][minute_key]
+
+            if count_min > SPAM_LIMIT_PER_MIN:
+                strike, band_until = inc_strike_and_band(row_idx, tele_id, username, count_min)
+                tg_send(
+                    chat_id,
+                    "🚫 <b>SPAM PHÁT HIỆN</b>\n\n"
+                    f"⚠️ Strike: <b>{strike}</b>\n"
+                    f"⏱️ Band tới: <b>{band_until.strftime('%H:%M %d/%m')}</b>"
+                )
+                return
+            
+            # Gửi thông báo đang check
+            if len(phones) == 1:
+                tg_send(chat_id, f"🔄 <b>Đang kiểm tra số {phones[0]}...</b>")
             else:
-                result_msg += f"\n❌ <code>{phone}</code> - KHÔNG ZIN"
-        
-        result_msg += "\n\n💡 <i>Tap vào số để copy</i>"
-        
-        tg_send(chat_id, result_msg, main_keyboard())
-        
-        # Log
-        log_check(tele_id, username, f"{len(phones)} số", balance, f"check_phones:zin={zin_count},not_zin={not_zin_count}")
+                tg_send(chat_id, f"🔄 <b>Đang kiểm tra {len(phones)} số...</b>")
+            
+            # Check tất cả số
+            results = check_multiple_phones(phones)
+            
+            # Xây dựng message kết quả
+            zin_count = sum(1 for r in results if r.get("success") and r.get("is_zin"))
+            not_zin_count = sum(1 for r in results if r.get("success") and not r.get("is_zin"))
+            error_count = sum(1 for r in results if not r.get("success"))
+            
+            result_msg = f"📊 <b>KẾT QUẢ CHECK {len(phones)} SỐ</b>\n\n"
+            result_msg += f"✅ Số zin: <b>{zin_count}</b>\n"
+            result_msg += f"❌ Số không zin: <b>{not_zin_count}</b>\n"
+            
+            if error_count > 0:
+                result_msg += f"⚠️ Lỗi: <b>{error_count}</b>\n"
+            
+            result_msg += "\n━━━━━━━━━━━━━━━\n"
+            
+            # Chi tiết từng số
+            for r in results:
+                phone = r["phone"]
+                success = r["success"]
+                is_zin = r["is_zin"]
+                note = r["note"]
+                
+                if not success:
+                    result_msg += f"\n⚠️ <code>{phone}</code> - Lỗi: {note}"
+                elif is_zin:
+                    result_msg += f"\n✅ <code>{phone}</code> - ZIN"
+                else:
+                    result_msg += f"\n❌ <code>{phone}</code> - KHÔNG ZIN"
+            
+            result_msg += "\n\n💡 <i>Tap vào số để copy</i>"
+            
+            tg_send(chat_id, result_msg, main_keyboard())
+            
+            # Log
+            log_check(tele_id, username, f"{len(phones)} số", balance, f"check_phones:zin={zin_count},not_zin={not_zin_count}")
+            return
+
+    # Check GHN SAU (sau khi check phone)
+    if is_ghn_code(text):
+        result = check_ghn(text)
+        tg_send(chat_id, result)
         return
 
     row_idx, user = get_user_row(tele_id)
