@@ -334,6 +334,11 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
     """
     Check số điện thoại qua API Shopee
     Returns: (req_ok, is_zin, error_code, note)
+    
+    Logic API Shopee:
+    - error = 0 hoặc null → Số ZIN (chưa đăng ký)
+    - error = 12301116 → Số KHÔNG ZIN (đã đăng ký)
+    - error = [khác] → Số ZIN (các lỗi khác không phải "đã đăng ký")
     """
     url = "https://shopee.vn/api/v4/account/management/check_unbind_phone"
     
@@ -368,12 +373,21 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
         
         error_code = data.get("error")
         
-        # error = 12301116 → Số KHÔNG ZIN (đã đăng ký Shopee)
+        # ✅ CHỈ CÓ error = 12301116 mới là KHÔNG ZIN (đã đăng ký Shopee)
         if error_code == 12301116:
             return True, False, error_code, "Đã đăng ký Shopee"
         
-        # Số ZIN
-        return True, True, error_code, "Chưa đăng ký Shopee"
+        # ✅ Tất cả các trường hợp khác đều là ZIN (bao gồm error=0, error=null, hoặc error khác)
+        # Giải thích:
+        # - error = 0 hoặc null: Số hoàn toàn sạch, có thể đăng ký
+        # - error = [khác]: Có thể là lỗi format, rate limit, etc nhưng KHÔNG phải "đã đăng ký"
+        note = "Chưa đăng ký Shopee"
+        if error_code == 0 or error_code is None:
+            note = "Số sạch, có thể đăng ký"
+        elif error_code:
+            note = f"Chưa đăng ký (error={error_code})"
+        
+        return True, True, error_code, note
         
     except requests.exceptions.Timeout:
         return False, False, -1, "Timeout"
