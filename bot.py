@@ -335,10 +335,9 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
     Check số điện thoại qua API Shopee
     Returns: (req_ok, is_zin, error_code, note)
     
-    Logic API Shopee:
-    - error = 0 hoặc null → Số ZIN (chưa đăng ký)
-    - error = 12301116 → Số KHÔNG ZIN (đã đăng ký)
-    - error = [khác] → Số ZIN (các lỗi khác không phải "đã đăng ký")
+    Logic API Shopee (từ appv2.py):
+    - error = 12301116 → is_ok = False → KHÔNG ZIN (đã đăng ký)
+    - error != 12301116 → is_ok = True → ZIN (chưa đăng ký)
     """
     url = "https://shopee.vn/api/v4/account/management/check_unbind_phone"
     
@@ -357,6 +356,10 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=4)
         
+        # Log để debug
+        print(f"[CHECK] Phone: {phone84}")
+        print(f"[CHECK] Status: {response.status_code}")
+        
         if response.status_code in (401, 403):
             return False, False, response.status_code, "Cookie hết hạn"
         
@@ -365,6 +368,7 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
         
         try:
             data = response.json()
+            print(f"[CHECK] Response: {data}")  # Log full response
         except Exception:
             return False, False, -1, "JSON parse error"
         
@@ -372,26 +376,20 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
             return False, False, -1, "Invalid response"
         
         error_code = data.get("error")
+        print(f"[CHECK] Error code: {error_code}")
         
-        # ✅ CHỈ CÓ error = 12301116 mới là KHÔNG ZIN (đã đăng ký Shopee)
+        # ✅ LOGIC CHÍNH XÁC từ appv2.py line 875-877
+        # CHỈ CÓ error = 12301116 mới là KHÔNG ZIN
         if error_code == 12301116:
             return True, False, error_code, "Đã đăng ký Shopee"
         
-        # ✅ Tất cả các trường hợp khác đều là ZIN (bao gồm error=0, error=null, hoặc error khác)
-        # Giải thích:
-        # - error = 0 hoặc null: Số hoàn toàn sạch, có thể đăng ký
-        # - error = [khác]: Có thể là lỗi format, rate limit, etc nhưng KHÔNG phải "đã đăng ký"
-        note = "Chưa đăng ký Shopee"
-        if error_code == 0 or error_code is None:
-            note = "Số sạch, có thể đăng ký"
-        elif error_code:
-            note = f"Chưa đăng ký (error={error_code})"
-        
-        return True, True, error_code, note
+        # ✅ Tất cả các trường hợp khác đều là ZIN
+        return True, True, error_code, f"Chưa đăng ký (error={error_code})"
         
     except requests.exceptions.Timeout:
         return False, False, -1, "Timeout"
     except Exception as e:
+        print(f"[CHECK] Exception: {e}")
         return False, False, -1, f"Error: {str(e)}"
 
 def check_shopee_phone_with_sheet_cookies(phone: str, cookies: List[str]) -> tuple:
