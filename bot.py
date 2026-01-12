@@ -2107,11 +2107,8 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
         # ✅ Gửi thông báo nhắc quét (RÚT GỌN)
         tg_send(
             chat_id,
-            "⏳ <b>VUI LÒNG QUÉT MÃ QR</b>
-
-"
-            "📱 Mở Shopee App → Quét QR
-"
+            "⏳ <b>VUI LÒNG QUÉT MÃ QR</b>\n\n"
+            "📱 Mở Shopee App → Quét QR\n"
             "⚠️ QR có hiệu lực trong 5 phút"
         )
         
@@ -2126,11 +2123,8 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
                 if sess:
                     tg_send(
                         sess.get("chat_id"), 
-                        "⏰ <b>HẾT THỜI GIAN</b>
-
-"
-                        "❌ QR đã hết hiệu lực (5 phút)
-"
+                        "⏰ <b>HẾT THỜI GIAN</b>\n\n"
+                        "❌ QR đã hết hiệu lực (5 phút)\n"
                         "👉 Vui lòng tạo QR mới", 
                         main_keyboard()
                     )
@@ -2166,11 +2160,8 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
             if not ok and status == "EXPIRED":
                 tg_send(
                     chat_id, 
-                    "⏰ <b>HẾT THỜI GIAN</b>
-
-"
-                    "❌ QR đã hết hiệu lực (5 phút)
-"
+                    "⏰ <b>HẾT THỜI GIAN</b>\n\n"
+                    "❌ QR đã hết hiệu lực (5 phút)\n"
                     "👉 Vui lòng tạo QR mới", 
                     main_keyboard()
                 )
@@ -2196,11 +2187,7 @@ def _auto_watch_qr_and_send_cookie(session_id: str):
             if sess:
                 tg_send(
                     sess.get("chat_id"), 
-                    f"❌ <b>Lỗi theo dõi QR</b>
-
-{esc(str(e))}
-
-"
+                    f"❌ <b>Lỗi theo dõi QR</b>\n\n{esc(str(e))}\n\n"
                     "👉 Bạn có thể bấm <b>🔄 Check QR Status</b> để thử lại.", 
                     get_cookie_keyboard()
                 )
