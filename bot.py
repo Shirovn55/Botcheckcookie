@@ -214,13 +214,29 @@ GS_COOKIE_TAB = os.getenv("GOOGLE_SHEET_COOKIE_TAB", "Cookie").strip()
 PRIMARY_POOL_SIZE = 6  # Số cookie tối đa lấy từ sheet
 
 def _gs_read_live_cookies() -> List[str]:
-    """Đọc cookies từ Google Sheet để check số"""
-    if not GS_COOKIE_SHEET_ID or not GS_COOKIE_TAB:
-        return []
+    """
+    Đọc cookies từ Google Sheet để check số
+    Mặc định đọc từ tab "Cookie" trong sheet chính (SHEET_ID)
+    Nếu set GOOGLE_SHEET_COOKIE_ID thì đọc từ sheet riêng
+    """
     try:
-        ws = sh.worksheet(GS_COOKIE_TAB)
+        # Nếu có sheet riêng cho cookie thì dùng sheet đó
+        if GS_COOKIE_SHEET_ID and GS_COOKIE_SHEET_ID != SHEET_ID:
+            cookie_sheet = gc.open_by_key(GS_COOKIE_SHEET_ID)
+            ws = cookie_sheet.worksheet(GS_COOKIE_TAB or "Cookie")
+        else:
+            # Dùng sheet chính, tab Cookie
+            try:
+                ws = sh.worksheet("Cookie")
+            except Exception:
+                # Tab Cookie chưa có → tạo mới
+                ws = sh.add_worksheet("Cookie", rows=100, cols=2)
+                ws.update('A1', [['Cookie']])
+                return []
+        
         col = ws.col_values(1) or []
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] _gs_read_live_cookies: {e}")
         return []
     
     if col and col[0].strip().lower() == "cookie":
@@ -237,6 +253,10 @@ def _gs_read_live_cookies() -> List[str]:
             continue
         seen.add(c)
         out.append(c)
+    
+    if not out:
+        print("[WARN] No cookies found in sheet")
+        return []
     
     random.shuffle(out)
     return out[:PRIMARY_POOL_SIZE]
@@ -377,7 +397,7 @@ def check_shopee_phone_with_sheet_cookies(phone: str, cookies: List[str]) -> tup
 def check_multiple_phones(phones: List[str]) -> List[dict]:
     """
     Check nhiều số cùng lúc (max 10 số)
-    Returns: [{"phone": "0xxx", "is_zin": True/False, "note": "..."}]
+    Returns: [{"phone": "0xxx", "success": True/False, "is_zin": True/False, "note": "..."}]
     """
     # Giới hạn 10 số
     phones = phones[:10]
@@ -386,7 +406,12 @@ def check_multiple_phones(phones: List[str]) -> List[dict]:
     cookies = _gs_read_live_cookies()
     
     if not cookies:
-        return [{"phone": p, "is_zin": False, "note": "Không có cookie"} for p in phones]
+        return [{
+            "phone": p, 
+            "success": False, 
+            "is_zin": False, 
+            "note": "Không có cookie trong sheet"
+        } for p in phones]
     
     results = []
     
@@ -2881,8 +2906,25 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             else:
                 tg_send(chat_id, f"🔄 <b>Đang kiểm tra {len(phones)} số...</b>")
             
-            # Check tất cả số
-            results = check_multiple_phones(phones)
+            # Check tất cả số với try-catch
+            try:
+                results = check_multiple_phones(phones)
+            except Exception as e:
+                print(f"[ERROR] check_multiple_phones: {e}")
+                print(traceback.format_exc())
+                tg_send(
+                    chat_id,
+                    f"❌ <b>LỖI CHECK SỐ</b>\n\n"
+                    f"⚠️ Lỗi: {str(e)}\n\n"
+                    f"💡 <b>Nguyên nhân có thể:</b>\n"
+                    f"• Chưa cấu hình Google Sheet cho cookie\n"
+                    f"• Biến GOOGLE_SHEET_COOKIE_ID chưa set\n"
+                    f"• Tab Cookie chưa tạo trong sheet\n"
+                    f"• Không có cookie trong sheet\n\n"
+                    f"👉 Xem hướng dẫn tại HUONG_DAN_CHECK_SO_ZIN.md",
+                    main_keyboard()
+                )
+                return
             
             # Xây dựng message kết quả
             zin_count = sum(1 for r in results if r.get("success") and r.get("is_zin"))
