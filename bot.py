@@ -281,15 +281,21 @@ def normalize_phone_to_84(raw: str) -> str:
     return "84" + core
 
 def is_phone_number(text: str) -> bool:
-    """Kiểm tra có phải số điện thoại không"""
+    """
+    Kiểm tra có phải số điện thoại không
+    Hỗ trợ 3 dạng:
+    - 84912345678 (11 số)
+    - 0912345678 (10 số)
+    - 912345678 (9 số)
+    """
     if not text:
         return False
     
     # Lấy chỉ các chữ số
     digits = "".join(ch for ch in text if ch.isdigit())
     
-    # Kiểm tra độ dài
-    if len(digits) < 10 or len(digits) > 11:
+    # Kiểm tra độ dài (9, 10, hoặc 11 số)
+    if len(digits) < 9 or len(digits) > 11:
         return False
     
     # Kiểm tra prefix hợp lệ
@@ -299,6 +305,9 @@ def is_phone_number(text: str) -> bool:
     elif len(digits) == 10:
         # Format: 0xxxxxxxxx
         return digits.startswith("0")
+    elif len(digits) == 9:
+        # Format: xxxxxxxxx (không có số 0 đầu)
+        return not digits.startswith("0")
     
     return False
 
@@ -2683,20 +2692,34 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             "🤖 <b>Bot Check Đơn Hàng Shopee</b>\n"
             "━━━━━━━━━━━━━━━\n\n"
             "📦 <b>HỖ TRỢ CHECK:</b>\n"
-            "✅ Bằng Cookie Shopee\n"
-            "✅ Bằng MVĐ Shopee Express (SPX)\n"
-            "✅ Bằng MVĐ Giao Hàng Nhanh (GHN)\n"
+            "✅ Check Đơn Hàng bằng Cookie Shopee\n"
+            "✅ Check MVĐ Shopee Express (SPX)\n"
+            "✅ Check MVĐ Giao Hàng Nhanh (GHN)\n"
             "✅ Check Số Điện Thoại Zin Shopee\n\n"
-            "🔑 <b>HỖ TRỢ GET COOKIE:</b>\n"
-            "✅ Get Cookie qua QR Code (nhanh & an toàn)\n\n"
+            "🔑 <b>GET COOKIE SHOPEE:</b>\n"
+            "✅ Get Cookie qua QR Code\n"
+            "   <i>(Quét QR trong app Shopee → Nhận cookie ngay)</i>\n\n"
             "━━━━━━━━━━━━━━━\n"
-            "🧩 <b>HỆ THỐNG BOT NGÂNMIU</b>\n\n"
-            "🎟️ <b>Bot Lưu Voucher</b>\n"
-            "👉 @nganmiu_bot\n\n"
-            "📦 <b>Bot Check Đơn Hàng</b>\n"
-            "👉 @ShopeexCheck_Bot\n\n"
-            "🔑 <b>Bot Get Cookie QR</b>\n"
-            "👉 <i>Đã tích hợp trong bot này</i> ✅\n\n"
+            "📖 <b>HƯỚNG DẪN SỬ DỤNG:</b>\n\n"
+            "🍪 <b>Check Đơn Hàng bằng Cookie:</b>\n"
+            "👉 Gửi cookie Shopee cho bot\n"
+            "   (Dạng: SPC_ST=xxx...)\n\n"
+            "📱 <b>Check Số Zin:</b>\n"
+            "👉 Gửi số điện thoại (1-10 số)\n"
+            "   VD: 0912345678\n"
+            "   VD: 84912345678\n"
+            "   VD: 912345678\n\n"
+            "🔑 <b>Get Cookie QR:</b>\n"
+            "👉 Bấm nút <b>🔑 Get Cookie QR</b>\n"
+            "👉 Quét QR trong app Shopee\n"
+            "👉 Nhận cookie ngay lập tức\n\n"
+            "📦 <b>Check MVĐ:</b>\n"
+            "👉 Gửi mã vận đơn SPX hoặc GHN\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🧩 <b>HỆ THỐNG BOT NGÂNMIU:</b>\n\n"
+            "🎟️ <b>Bot Lưu Voucher:</b> @nganmiu_bot\n"
+            "📦 <b>Bot Check Đơn Hàng:</b> @ShopeexCheck_Bot\n"
+            "🔑 <b>Bot Get Cookie QR:</b> <i>Đã tích hợp</i> ✅\n\n"
             "━━━━━━━━━━━━━━━\n"
             "🧑‍💼 <b>Admin hỗ trợ:</b> @BonBonxHPx\n"
             "👥 <b>Group Hỗ Trợ:</b> https://t.me/botxshopee\n\n"
