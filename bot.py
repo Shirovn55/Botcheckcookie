@@ -19,6 +19,7 @@ import html
 import traceback
 import threading
 import base64
+import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
@@ -202,6 +203,202 @@ def normalize_tele_id(val: Any) -> str:
     # if scientific notation like 1.999E9 -> keep digits
     digits = re.sub(r"\D", "", s)
     return digits or s
+
+# =========================================================
+# 🔥 CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN
+# =========================================================
+
+# Config Google Sheet cho Cookie check số
+GS_COOKIE_SHEET_ID = os.getenv("GOOGLE_SHEET_COOKIE_ID", "").strip()
+GS_COOKIE_TAB = os.getenv("GOOGLE_SHEET_COOKIE_TAB", "Cookie").strip()
+PRIMARY_POOL_SIZE = 6  # Số cookie tối đa lấy từ sheet
+
+def _gs_read_live_cookies() -> List[str]:
+    """Đọc cookies từ Google Sheet để check số"""
+    if not GS_COOKIE_SHEET_ID or not GS_COOKIE_TAB:
+        return []
+    try:
+        ws = sh.worksheet(GS_COOKIE_TAB)
+        col = ws.col_values(1) or []
+    except Exception:
+        return []
+    
+    if col and col[0].strip().lower() == "cookie":
+        col = col[1:]
+    
+    seen, out = set(), []
+    for c in col:
+        c = (c or "").strip()
+        if not c:
+            continue
+        if "SPC_ST=" not in c and "=" not in c:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    
+    random.shuffle(out)
+    return out[:PRIMARY_POOL_SIZE]
+
+def normalize_phone_to_84(raw: str) -> str:
+    """Chuẩn hóa số điện thoại về dạng 84xxxxxxxxx"""
+    if not isinstance(raw, str):
+        return None
+    
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    
+    if digits.startswith("84"):
+        core = digits[2:]
+    elif digits.startswith("0"):
+        core = digits[1:]
+    else:
+        core = digits[-9:] if len(digits) >= 9 else digits
+    
+    if len(core) != 9 or not core.isdigit():
+        return None
+    
+    return "84" + core
+
+def is_phone_number(text: str) -> bool:
+    """Kiểm tra có phải số điện thoại không"""
+    if not text:
+        return False
+    
+    digits = "".join(ch for ch in text if ch.isdigit())
+    
+    if len(digits) < 10 or len(digits) > 11:
+        return False
+    
+    if digits.startswith("84"):
+        return len(digits) == 11
+    elif digits.startswith("0"):
+        return len(digits) == 10
+    
+    return False
+
+def extract_phone_numbers(text: str) -> List[str]:
+    """
+    Trích xuất tất cả số điện thoại từ text
+    Hỗ trợ nhiều số trên nhiều dòng
+    """
+    lines = text.split('\n')
+    phones = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Kiểm tra từng dòng có phải số không
+        if is_phone_number(line):
+            phones.append(line)
+    
+    return phones
+
+def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
+    """
+    Check số điện thoại qua API Shopee
+    Returns: (req_ok, is_zin, error_code, note)
+    """
+    url = "https://shopee.vn/api/v4/account/management/check_unbind_phone"
+    
+    headers = {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Cookie": cookie.strip(),
+    }
+    
+    payload = {
+        "phone": phone84,
+        "device_sz_fingerprint": os.getenv("SHOPEE_FINGERPRINT", "")
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=4)
+        
+        if response.status_code in (401, 403):
+            return False, False, response.status_code, "Cookie hết hạn"
+        
+        if response.status_code != 200:
+            return False, False, response.status_code, f"HTTP {response.status_code}"
+        
+        try:
+            data = response.json()
+        except Exception:
+            return False, False, -1, "JSON parse error"
+        
+        if not isinstance(data, dict):
+            return False, False, -1, "Invalid response"
+        
+        error_code = data.get("error")
+        
+        # error = 12301116 → Số KHÔNG ZIN (đã đăng ký Shopee)
+        if error_code == 12301116:
+            return True, False, error_code, "Đã đăng ký Shopee"
+        
+        # Số ZIN
+        return True, True, error_code, "Chưa đăng ký Shopee"
+        
+    except requests.exceptions.Timeout:
+        return False, False, -1, "Timeout"
+    except Exception as e:
+        return False, False, -1, f"Error: {str(e)}"
+
+def check_shopee_phone_with_sheet_cookies(phone: str, cookies: List[str]) -> tuple:
+    """
+    Check số điện thoại với cookies từ Google Sheet
+    Returns: (success, is_zin, note)
+    """
+    phone84 = normalize_phone_to_84(phone)
+    if not phone84:
+        return False, False, "Số không hợp lệ"
+    
+    if not cookies:
+        return False, False, "Không có cookie"
+    
+    # Thử tối đa 2 cookie
+    for cookie in cookies[:2]:
+        req_ok, is_zin, error_code, note = check_shopee_phone_api(cookie, phone84)
+        
+        if not req_ok:
+            continue  # Thử cookie tiếp
+        
+        return True, is_zin, note
+    
+    return False, False, "Cookies lỗi"
+
+def check_multiple_phones(phones: List[str]) -> List[dict]:
+    """
+    Check nhiều số cùng lúc (max 10 số)
+    Returns: [{"phone": "0xxx", "is_zin": True/False, "note": "..."}]
+    """
+    # Giới hạn 10 số
+    phones = phones[:10]
+    
+    # Đọc cookies từ Google Sheet
+    cookies = _gs_read_live_cookies()
+    
+    if not cookies:
+        return [{"phone": p, "is_zin": False, "note": "Không có cookie"} for p in phones]
+    
+    results = []
+    
+    for phone in phones:
+        success, is_zin, note = check_shopee_phone_with_sheet_cookies(phone, cookies)
+        
+        results.append({
+            "phone": phone,
+            "success": success,
+            "is_zin": is_zin,
+            "note": note
+        })
+        
+        # Delay nhẹ giữa các request
+        time.sleep(0.3)
+    
+    return results
 
 # =========================================================
 # 🔥 QR LOGIN FUNCTIONS
@@ -2458,7 +2655,8 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
             "📦 <b>HỖ TRỢ CHECK:</b>\n"
             "✅ Bằng Cookie Shopee\n"
             "✅ Bằng MVĐ Shopee Express (SPX)\n"
-            "✅ Bằng MVĐ Giao Hàng Nhanh (GHN)\n\n"
+            "✅ Bằng MVĐ Giao Hàng Nhanh (GHN)\n"
+            "✅ Check Số Điện Thoại Zin Shopee\n\n"
             "🔑 <b>HỖ TRỢ GET COOKIE:</b>\n"
             "✅ Get Cookie qua QR Code (nhanh & an toàn)\n\n"
             "━━━━━━━━━━━━━━━\n"
@@ -2609,6 +2807,113 @@ def _handle_message(chat_id: Any, tele_id: Any, username: str, text: str, data: 
     if is_ghn_code(text):
         result = check_ghn(text)
         tg_send(chat_id, result)
+        return
+
+    # ✅ CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN (hỗ trợ max 10 số)
+    if is_phone_number(text) or '\n' in text and any(is_phone_number(line.strip()) for line in text.split('\n')):
+        row_idx, user = get_user_row(tele_id)
+        if not user:
+            tg_send(
+                chat_id,
+                "❌ <b>Bạn chưa kích hoạt</b>\n\n"
+                "👉 Kích hoạt tại @nganmiu_bot",
+                main_keyboard()
+            )
+            return
+        
+        # Check band
+        is_band, until = check_band(row_idx)
+        if is_band:
+            tg_send(
+                chat_id, 
+                "🚫 <b>Tài khoản đang bị khóa</b>\n\n"
+                f"⏱️ Mở lại lúc: <b>{until.strftime('%H:%M %d/%m')}</b>"
+            )
+            return
+        
+        # Trích xuất các số điện thoại
+        phones = extract_phone_numbers(text)
+        
+        if not phones:
+            return  # Không phải số điện thoại hợp lệ
+        
+        # Giới hạn 10 số
+        if len(phones) > 10:
+            tg_send(
+                chat_id,
+                f"⚠️ <b>QUÁ NHIỀU SỐ</b>\n\n"
+                f"📊 Bạn gửi {len(phones)} số\n"
+                f"🔢 Bot chỉ check tối đa 10 số/lần\n\n"
+                f"👉 Vui lòng gửi lại với tối đa 10 số",
+                main_keyboard()
+            )
+            return
+        
+        # Check spam
+        balance = get_balance(user)
+        minute_key = now().strftime("%Y-%m-%d %H:%M")
+        tid = safe_text(tele_id)
+
+        _prune_spam_cache_for_user(tid, keep_minutes=3)
+
+        with spam_lock:
+            spam_cache.setdefault(tid, {})
+            spam_cache[tid][minute_key] = spam_cache[tid].get(minute_key, 0) + len(phones)
+            count_min = spam_cache[tid][minute_key]
+
+        if count_min > SPAM_LIMIT_PER_MIN:
+            strike, band_until = inc_strike_and_band(row_idx, tele_id, username, count_min)
+            tg_send(
+                chat_id,
+                "🚫 <b>SPAM PHÁT HIỆN</b>\n\n"
+                f"⚠️ Strike: <b>{strike}</b>\n"
+                f"⏱️ Band tới: <b>{band_until.strftime('%H:%M %d/%m')}</b>"
+            )
+            return
+        
+        # Gửi thông báo đang check
+        if len(phones) == 1:
+            tg_send(chat_id, f"🔄 <b>Đang kiểm tra số {phones[0]}...</b>")
+        else:
+            tg_send(chat_id, f"🔄 <b>Đang kiểm tra {len(phones)} số...</b>")
+        
+        # Check tất cả số
+        results = check_multiple_phones(phones)
+        
+        # Xây dựng message kết quả
+        zin_count = sum(1 for r in results if r.get("success") and r.get("is_zin"))
+        not_zin_count = sum(1 for r in results if r.get("success") and not r.get("is_zin"))
+        error_count = sum(1 for r in results if not r.get("success"))
+        
+        result_msg = f"📊 <b>KẾT QUẢ CHECK {len(phones)} SỐ</b>\n\n"
+        result_msg += f"✅ Số zin: <b>{zin_count}</b>\n"
+        result_msg += f"❌ Số không zin: <b>{not_zin_count}</b>\n"
+        
+        if error_count > 0:
+            result_msg += f"⚠️ Lỗi: <b>{error_count}</b>\n"
+        
+        result_msg += "\n━━━━━━━━━━━━━━━\n"
+        
+        # Chi tiết từng số
+        for r in results:
+            phone = r["phone"]
+            success = r["success"]
+            is_zin = r["is_zin"]
+            note = r["note"]
+            
+            if not success:
+                result_msg += f"\n⚠️ <code>{phone}</code> - Lỗi: {note}"
+            elif is_zin:
+                result_msg += f"\n✅ <code>{phone}</code> - ZIN"
+            else:
+                result_msg += f"\n❌ <code>{phone}</code> - KHÔNG ZIN"
+        
+        result_msg += "\n\n💡 <i>Tap vào số để copy</i>"
+        
+        tg_send(chat_id, result_msg, main_keyboard())
+        
+        # Log
+        log_check(tele_id, username, f"{len(phones)} số", balance, f"check_phones:zin={zin_count},not_zin={not_zin_count}")
         return
 
     row_idx, user = get_user_row(tele_id)
