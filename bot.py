@@ -95,7 +95,7 @@ else:
     print("[PAYMENT] Disabled")
 
 # QR API Configuration
-QR_API_BASE = os.getenv("QR_API_BASE", "https://qr-shopee-puce.vercel.app").strip()
+QR_API_BASE = os.getenv("QR_API_BASE", "https://qr-shopee-rho.vercel.app").strip()
 QR_POLL_INTERVAL = float(os.getenv("QR_POLL_INTERVAL", "3.0"))  # giây check 1 lần  # giây check 1 lần (tăng tốc)
 QR_TIMEOUT = 300  # 5 phút timeout
 COOKIE_VALIDITY_DAYS = 7  # ✅ Cookie hiệu lực 7 ngày
