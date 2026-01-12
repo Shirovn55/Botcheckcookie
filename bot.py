@@ -208,40 +208,26 @@ def normalize_tele_id(val: Any) -> str:
 # 🔥 CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN
 # =========================================================
 
-# Config Google Sheet cho Cookie check số
-GS_COOKIE_SHEET_ID = os.getenv("GOOGLE_SHEET_COOKIE_ID", "").strip()
-GS_COOKIE_TAB = os.getenv("GOOGLE_SHEET_COOKIE_TAB", "Cookie").strip()
 PRIMARY_POOL_SIZE = 6  # Số cookie tối đa lấy từ sheet
 
 def _gs_read_live_cookies() -> List[str]:
     """
-    Đọc cookies từ Google Sheet để check số
-    Mặc định đọc từ tab "Cookie" trong sheet chính (SHEET_ID)
-    Nếu set GOOGLE_SHEET_COOKIE_ID thì đọc từ sheet riêng
+    Đọc cookies từ tab "Cookie" trong Google Sheet chính
     """
     try:
-        # Nếu có sheet riêng cho cookie thì dùng sheet đó
-        if GS_COOKIE_SHEET_ID and GS_COOKIE_SHEET_ID != SHEET_ID:
-            cookie_sheet = gc.open_by_key(GS_COOKIE_SHEET_ID)
-            ws = cookie_sheet.worksheet(GS_COOKIE_TAB or "Cookie")
-        else:
-            # Dùng sheet chính, tab Cookie
-            try:
-                ws = sh.worksheet("Cookie")
-            except Exception:
-                # Tab Cookie chưa có → tạo mới
-                ws = sh.add_worksheet("Cookie", rows=100, cols=2)
-                ws.update('A1', [['Cookie']])
-                return []
-        
+        # Đọc từ tab "Cookie" trong sheet chính
+        ws = sh.worksheet("Cookie")
         col = ws.col_values(1) or []
     except Exception as e:
-        print(f"[ERROR] _gs_read_live_cookies: {e}")
+        print(f"[ERROR] Không đọc được tab Cookie: {e}")
+        print(f"[ERROR] Vui lòng tạo tab 'Cookie' trong Google Sheet")
         return []
     
+    # Bỏ header nếu có
     if col and col[0].strip().lower() == "cookie":
         col = col[1:]
     
+    # Lọc cookies hợp lệ
     seen, out = set(), []
     for c in col:
         c = (c or "").strip()
@@ -255,9 +241,10 @@ def _gs_read_live_cookies() -> List[str]:
         out.append(c)
     
     if not out:
-        print("[WARN] No cookies found in sheet")
+        print("[WARN] Tab Cookie không có cookie nào!")
         return []
     
+    print(f"[INFO] Đọc được {len(out)} cookies từ Google Sheet")
     random.shuffle(out)
     return out[:PRIMARY_POOL_SIZE]
 
