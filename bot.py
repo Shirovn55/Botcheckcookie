@@ -208,6 +208,9 @@ def normalize_tele_id(val: Any) -> str:
 # 🔥 CHECK SỐ ĐIỆN THOẠI SHOPEE ZIN
 # =========================================================
 
+ERROR_ZIN  = 10013      # ✅ Số ZIN (chưa đăng ký Shopee)
+ERROR_USED = 12301116   # ❌ Số đã đăng ký Shopee
+
 PRIMARY_POOL_SIZE = 6  # Số cookie tối đa lấy từ sheet
 
 def _gs_read_live_cookies() -> List[str]:
@@ -321,62 +324,64 @@ def check_shopee_phone_api(cookie: str, phone84: str) -> tuple:
     """
     Check số điện thoại qua API Shopee
     Returns: (req_ok, is_zin, error_code, note)
-    
-    Logic API Shopee (từ appv2.py):
-    - error = 12301116 → is_ok = False → KHÔNG ZIN (đã đăng ký)
-    - error != 12301116 → is_ok = True → ZIN (chưa đăng ký)
+
+    ✅ Logic chuẩn (chống báo ZIN sai):
+    - error = 10013   -> ✅ ZIN (chưa đăng ký Shopee)
+    - error = 12301116-> ❌ Đã đăng ký Shopee
+    - error khác / None -> ❌ Không xác định / coi như không ZIN (tránh false-positive)
     """
     url = "https://shopee.vn/api/v4/account/management/check_unbind_phone"
-    
+
     headers = {
         "User-Agent": UA,
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Cookie": cookie.strip(),
     }
-    
+
     payload = {
         "phone": phone84,
         "device_sz_fingerprint": os.getenv("SHOPEE_FINGERPRINT", "")
     }
-    
+
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=4)
-        
-        # Log để debug
-        print(f"[CHECK] Phone: {phone84}")
-        print(f"[CHECK] Status: {response.status_code}")
-        
+
         if response.status_code in (401, 403):
             return False, False, response.status_code, "Cookie hết hạn"
-        
+
         if response.status_code != 200:
             return False, False, response.status_code, f"HTTP {response.status_code}"
-        
+
         try:
             data = response.json()
-            print(f"[CHECK] Response: {data}")  # Log full response
         except Exception:
             return False, False, -1, "JSON parse error"
-        
+
         if not isinstance(data, dict):
             return False, False, -1, "Invalid response"
-        
+
         error_code = data.get("error")
-        print(f"[CHECK] Error code: {error_code}")
-        
-        # ✅ LOGIC CHÍNH XÁC từ appv2.py line 875-877
-        # CHỈ CÓ error = 12301116 mới là KHÔNG ZIN
-        if error_code == 12301116:
-            return True, False, error_code, "Đã đăng ký Shopee"
-        
-        # ✅ Tất cả các trường hợp khác đều là ZIN
-        return True, True, error_code, f"Chưa đăng ký (error={error_code})"
-        
+
+        # ép về int nếu Shopee trả string
+        try:
+            if isinstance(error_code, str) and error_code.isdigit():
+                error_code = int(error_code)
+        except Exception:
+            pass
+
+        if error_code == ERROR_ZIN:
+            return True, True, error_code, "✅ Số ZIN (chưa đăng ký Shopee)"
+
+        if error_code == ERROR_USED:
+            return True, False, error_code, "❌ Đã đăng ký Shopee"
+
+        # Các code lạ: coi như không ZIN để tránh báo nhầm
+        return True, False, error_code, f"⚠️ Không xác định / không ZIN (error={error_code})"
+
     except requests.exceptions.Timeout:
         return False, False, -1, "Timeout"
     except Exception as e:
-        print(f"[CHECK] Exception: {e}")
         return False, False, -1, f"Error: {str(e)}"
 
 def check_shopee_phone_with_sheet_cookies(phone: str, cookies: List[str]) -> tuple:
@@ -1403,7 +1408,38 @@ CODE_MAP = {
     "order_list_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
     "order_status_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
     "order_status_text_to_ship_order_edt_cod": ("📦 Chờ shop gửi hàng (COD)", "warning"),
+    "order_status_text_to_ship_order_edt_cod_range":     ("🎖 Đơn hàng chờ Shopee duyệt (COD)", "warning"),
+    "order_status_text_to_ship_order_edt_non_cod_range": ("🎖 Đơn hàng chờ Shopee duyệt", "warning"),
+    "order_status_text_to_ship_order_edt_non_cod":       ("🎖 Đơn hàng chờ Shopee duyệt", "warning"),
 }
+
+
+def unwrap_status_value(v: Any) -> str:
+    """
+    Shopee đôi lúc trả status dạng object lồng nhau:
+    {'text': {'text': 'order_status_xxx', ...}, ...}
+    => bóc ra string 'order_status_xxx'
+    """
+    for _ in range(6):
+        if isinstance(v, dict):
+            if 'text' in v:
+                v = v.get('text')
+                continue
+            if 'header_text' in v:
+                v = v.get('header_text')
+                continue
+            if 'list_view_text' in v:
+                v = v.get('list_view_text')
+                continue
+            break
+        else:
+            break
+
+    if isinstance(v, str):
+        return v.strip()
+    if v is None:
+        return '-'
+    return str(v).strip()
 
 def normalize_status_text(status: str) -> str:
     if not isinstance(status, str):
@@ -1658,7 +1694,8 @@ def format_order_simple(detail: dict) -> str:
             or "-"
         )
 
-    status_text = status_text.strip() if isinstance(status_text, str) else "-"
+    status_text = unwrap_status_value(status_text)
+    status_text = status_text.strip() if isinstance(status_text, str) else '-'
 
     if not status_text or status_text == "-":
         status_obj = find_first_key(detail, "status")
@@ -1673,7 +1710,8 @@ def format_order_simple(detail: dict) -> str:
         elif status_obj is not None:
             raw_status = str(status_obj)
 
-        raw_status = normalize_status_text(str(raw_status))
+        raw_status = unwrap_status_value(raw_status)
+        raw_status = normalize_status_text(raw_status)
         st2, _ = map_code(raw_status)
         status_text = st2 or raw_status or "-"
 
@@ -1754,9 +1792,12 @@ def format_order_simple(detail: dict) -> str:
     return output
 
 def map_code(code):
-    if not isinstance(code, str):
-        return None, "secondary"
-    return CODE_MAP.get(code, (code, "secondary"))
+    # Shopee có thể trả dict lồng nhau -> bóc ra string
+    code = unwrap_status_value(code)
+    if not isinstance(code, str) or not code:
+        return None, 'secondary'
+    code = normalize_status_text(code)
+    return CODE_MAP.get(code, (code, 'secondary'))
 
 def check_shopee_orders(cookie: str) -> Tuple[Optional[str], Optional[str]]:
     """✅ CACHE COOKIE: Check với cache"""
